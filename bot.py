@@ -34,7 +34,7 @@ OPENCODE_DIR = os.getenv("OPENCODE_DIR", str(Path.home()))
 OC_PORT = int(os.getenv("OPENCODE_SERVER_PORT", "4100"))
 OC_URL = os.getenv("OPENCODE_SERVER_URL", f"http://127.0.0.1:{OC_PORT}")
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
@@ -384,7 +384,7 @@ def _summary(turn: dict) -> list[str]:
     if turn["edits"]:
         out.append(f"\u270f\ufe0f *editou:* " + ", ".join(sorted(f"`{_fmt_path(x)}`" for x in turn["edits"])))
     if turn["rejected"]:
-        out.append(f"\u274c *negado:* {len(turn['rejected'])} permiss\u00f5e(s)")
+        out.append(f"\u274c *negado:* {turn['rejected']} permiss\u00f5e(s)")
     return out
 
 
@@ -407,25 +407,29 @@ def _trace_lines(turn: dict, max_steps: int = 40, max_out: int = 500) -> list[st
     return lines
 
 
-def _render_done(turn: dict, elapsed: float, answer: str = "") -> str:
-    def build(trace_cfg):
-        lines = []
-        if answer:
-            lines.append(answer)
-        summaries = _summary(turn)
-        if summaries:
-            lines += ["", "\u2014\u2014\u2014", *summaries]
-        trace = _trace_lines(turn, *trace_cfg)
-        if trace:
-            lines += ["", *trace]
-        return "\n".join(lines)
-
-    total = build((40, 500))
-    if len(total) > 3800:
-        total = build((4, 220))
+def _render_think(turn: dict, elapsed: float) -> str:
+    mins, secs = int(elapsed) // 60, int(elapsed) % 60
+    lines = [f"\U0001f4ad *pensou em {mins}m{secs:02d}s:*"]
+    summaries = _summary(turn)
+    if summaries:
+        lines += ["", "\u2014\u2014\u2014", *summaries]
+    trace = _trace_lines(turn)
+    if trace:
+        lines += ["", *trace]
+    total = "\n".join(lines)
     if len(total) > 3950:
-        total = total[:3950]
+        total = total[:3950] + "\n\u2026"
     return total
+
+
+def _result_text(turn: dict) -> tuple[str, str]:
+    head = "\U0001f4ac *resultado:*\n\n"
+    body = (turn["out_text"] or "").strip().replace("```", "'''")
+    if not body:
+        return head + "_escrevendo\u2026_", ""
+    if len(head) + len(body) > 3900:
+        return head + "\u2026" + body[-3900:], ""
+    return head + body, ""
 
 
 # ---------------------------------------------------------------- turn plumbing
@@ -437,7 +441,7 @@ async def _push_status(turn: dict, force: bool = False):
         return
     turn["last_edit"] = now
     if turn.get("done"):
-        text = _render_done(turn, turn.get("elapsed", 0.0))
+        text = _render_think(turn, turn.get("elapsed", 0.0))
         kb = None
     else:
         text, kb = _render_running(turn)
@@ -482,22 +486,40 @@ def _stop_typing(turn: dict):
 STREAM_MIN = 150
 
 
-async def _flush_stream(turn: dict):
-    """Sends the unanswered tail of out_text, in order, as new messages."""
-    text = turn["out_text"]
-    tail = text[turn["streamed_len"]:]
-    if not tail:
+async def _update_result(turn: dict, force: bool = False):
+    """Updates the result balloon, creating it lazily once there's enough text."""
+    text, _ = _result_text(turn)
+    if text == turn.get("result_last"):
         return
-    if not turn["done"] and len(tail.strip()) < STREAM_MIN:
-        return
-    for part in _split_text(tail, 3500):
+    if turn["result_msg_id"] is None:
+        if not force and not turn["done"] and len(text.strip()) < STREAM_MIN:
+            return
+        msg = await _app_ref.bot.send_message(turn["chat_id"], text, parse_mode="Markdown")
+        turn["result_msg_id"] = msg.message_id
+    else:
         try:
-            await _app_ref.bot.send_message(chat_id=turn["chat_id"], text=part, parse_mode="Markdown")
+            await _app_ref.bot.edit_message_text(
+                chat_id=turn["chat_id"], message_id=turn["result_msg_id"], text=text, parse_mode="Markdown"
+            )
         except TelegramError:
             try:
-                await _app_ref.bot.send_message(chat_id=turn["chat_id"], text=part)
+                await _app_ref.bot.edit_message_text(
+                    chat_id=turn["chat_id"], message_id=turn["result_msg_id"], text=text
+                )
             except TelegramError:
-                break
+                pass
+    turn["result_last"] = text
+
+
+async def _flush_stream(turn: dict, force: bool = False):
+    """Feeds the tail of out_text into the result balloon as it grows."""
+    text = turn["out_text"]
+    tail = text[turn["streamed_len"]:]
+    if not tail and not force:
+        return
+    if turn["result_msg_id"] is None and not turn["done"] and len(tail.strip()) < STREAM_MIN:
+        return
+    await _update_result(turn, force=force)
     turn["streamed_len"] = len(text)
 
 
@@ -603,12 +625,14 @@ async def _start_turn(update_or_chat, text: str):
         sid = await oc_create_session()
         chat_cfg["sid"] = sid
 
-    placeholder = await update_or_chat.message.reply_text("\u23f3 *opencode pensando\u2026*", parse_mode="Markdown")
+    placeholder = await update_or_chat.message.reply_text("\U0001f4ad *opencode pensando\u2026*", parse_mode="Markdown")
 
     turn = {
         "chat_id": chat_id,
         "sid": sid,
         "status_msg_id": placeholder.message_id,
+        "result_msg_id": None,
+        "result_last": "",
         "started": time.monotonic(),
         "last_edit": 0.0,
         "busy": True,
@@ -656,28 +680,52 @@ async def _finish_turn(chat_id: int):
     turn["awaiting_custom"] = None
     _stop_typing(turn)
     _stop_stream(turn)
-    await _flush_stream(turn)
-    # se o texto já foi transmitido em fluxo, a mensagem final é só o resumo
-    answer = "" if turn["streamed_len"] else (turn["out_text"].strip() or "(sem resposta)")
-    text = _render_done(turn, turn["elapsed"], answer)
-    chunks = _split_text(text)
+
     app = _app_ref
-    try:
-        await app.bot.edit_message_text(
-            chat_id=chat_id, message_id=turn["status_msg_id"], text=chunks[0], parse_mode="Markdown"
-        )
-    except TelegramError:
+    # ---- balão do resultado ----
+    answer = (turn["out_text"] or "").strip().replace("```", "'''")
+    if not answer:
+        answer = "(sem resposta)"
+    head = "\U0001f4ac *resultado:*\n\n"
+    limit = 3900
+    if len(head) + len(answer) > limit:
+        first_body, rest = answer[: limit - len(head)], answer[limit - len(head):]
+    else:
+        first_body, rest = answer, ""
+    if turn["result_msg_id"] is None:
+        msg = await app.bot.send_message(chat_id=chat_id, text=head + first_body, parse_mode="Markdown")
+        turn["result_msg_id"] = msg.message_id
+    else:
         try:
             await app.bot.edit_message_text(
-                chat_id=chat_id, message_id=turn["status_msg_id"], text=chunks[0]
+                chat_id=chat_id, message_id=turn["result_msg_id"], text=head + first_body, parse_mode="Markdown"
             )
         except TelegramError:
-            return
-    for chunk in chunks[1:]:
+            try:
+                await app.bot.edit_message_text(
+                    chat_id=chat_id, message_id=turn["result_msg_id"], text=head + first_body
+                )
+            except TelegramError:
+                pass
+    for chunk in _split_text(rest):
         try:
             await app.bot.send_message(chat_id=chat_id, text=chunk, parse_mode="Markdown")
         except TelegramError:
             await app.bot.send_message(chat_id=chat_id, text=chunk)
+
+    # ---- balão do pensamento ----
+    text = _render_think(turn, turn["elapsed"])
+    try:
+        await app.bot.edit_message_text(
+            chat_id=chat_id, message_id=turn["status_msg_id"], text=text, parse_mode="Markdown"
+        )
+    except TelegramError:
+        try:
+            await app.bot.edit_message_text(
+                chat_id=chat_id, message_id=turn["status_msg_id"], text=text
+            )
+        except TelegramError:
+            pass
 
 
 def _split_text(text: str, limit: int = 4000) -> list[str]:
