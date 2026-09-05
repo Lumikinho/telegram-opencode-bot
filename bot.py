@@ -34,7 +34,7 @@ OPENCODE_DIR = os.getenv("OPENCODE_DIR", str(Path.home()))
 OC_PORT = int(os.getenv("OPENCODE_SERVER_PORT", "4100"))
 OC_URL = os.getenv("OPENCODE_SERVER_URL", f"http://127.0.0.1:{OC_PORT}")
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
@@ -423,13 +423,12 @@ def _render_think(turn: dict, elapsed: float) -> str:
 
 
 def _result_text(turn: dict) -> tuple[str, str]:
-    head = "\U0001f4ac *resultado:*\n\n"
     body = (turn["out_text"] or "").strip().replace("```", "'''")
     if not body:
-        return head + "_escrevendo\u2026_", ""
-    if len(head) + len(body) > 3900:
-        return head + "\u2026" + body[-3900:], ""
-    return head + body, ""
+        return "_escrevendo\u2026_", ""
+    if len(body) > 3900:
+        return "\u2026" + body[-3900:], ""
+    return body, ""
 
 
 # ---------------------------------------------------------------- turn plumbing
@@ -686,24 +685,23 @@ async def _finish_turn(chat_id: int):
     answer = (turn["out_text"] or "").strip().replace("```", "'''")
     if not answer:
         answer = "(sem resposta)"
-    head = "\U0001f4ac *resultado:*\n\n"
     limit = 3900
-    if len(head) + len(answer) > limit:
-        first_body, rest = answer[: limit - len(head)], answer[limit - len(head):]
+    if len(answer) > limit:
+        first_body, rest = answer[: limit], answer[limit:]
     else:
         first_body, rest = answer, ""
     if turn["result_msg_id"] is None:
-        msg = await app.bot.send_message(chat_id=chat_id, text=head + first_body, parse_mode="Markdown")
+        msg = await app.bot.send_message(chat_id=chat_id, text=first_body, parse_mode="Markdown")
         turn["result_msg_id"] = msg.message_id
     else:
         try:
             await app.bot.edit_message_text(
-                chat_id=chat_id, message_id=turn["result_msg_id"], text=head + first_body, parse_mode="Markdown"
+                chat_id=chat_id, message_id=turn["result_msg_id"], text=first_body, parse_mode="Markdown"
             )
         except TelegramError:
             try:
                 await app.bot.edit_message_text(
-                    chat_id=chat_id, message_id=turn["result_msg_id"], text=head + first_body
+                    chat_id=chat_id, message_id=turn["result_msg_id"], text=first_body
                 )
             except TelegramError:
                 pass
