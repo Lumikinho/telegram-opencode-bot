@@ -1,0 +1,14 @@
+# Segredos — nunca commitar
+.env
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Ambientes virtuais
+venv/
+.venv/
