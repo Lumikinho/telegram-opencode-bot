@@ -34,7 +34,7 @@ OPENCODE_DIR = os.getenv("OPENCODE_DIR", str(Path.home()))
 OC_PORT = int(os.getenv("OPENCODE_SERVER_PORT", "4100"))
 OC_URL = os.getenv("OPENCODE_SERVER_URL", f"http://127.0.0.1:{OC_PORT}")
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
@@ -211,6 +211,27 @@ async def oc_answer_permission(sid: str, perm_id: str, response: str):
     )
 
 
+async def oc_answer_question(request_id: str, answers: list) -> bool:
+    try:
+        r = await _client.post(
+            f"/question/{request_id}/reply",
+            json={"answers": answers},
+        )
+        return r.status_code < 400
+    except Exception as e:
+        logger.warning("Falha ao responder pergunta %s: %s", request_id, e)
+        return False
+
+
+async def oc_reject_question(request_id: str) -> bool:
+    try:
+        r = await _client.post(f"/question/{request_id}/reject")
+        return r.status_code < 400
+    except Exception as e:
+        logger.warning("Falha ao rejeitar pergunta %s: %s", request_id, e)
+        return False
+
+
 async def oc_abort(sid: str):
     try:
         await _client.post(f"/session/{sid}/abort")
@@ -270,22 +291,75 @@ def _tail_out(s: str, n: int = 450) -> str:
     return s
 
 
+def _btn_label(s: str, n: int = 40) -> str:
+    s = (s or "").strip().replace("\n", " ")
+    return s if len(s) <= n else s[: n - 1] + "\u2026"
+
+
+def _q_lines(turn: dict) -> list[str]:
+    lines: list[str] = []
+    first = True
+    for q in turn["questions"]:
+        sel = set(turn["qsel"].get((q["request_id"], q["qidx"])) or ())
+        if first:
+            lines += ["", "\u2753 *Escolha do opencode:*"]
+            first = False
+        if q.get("header"):
+            lines.append(f"*\u2014 {q['header']} \u2014*")
+        lines.append(q["question"] or "Selecione uma op\u00e7\u00e3o:")
+        for i, opt in enumerate(q["options"]):
+            mark = "\u2705" if i in sel else f"{i + 1}."
+            line = f"{mark} {opt.get('label')}"
+            if opt.get("description"):
+                line += f" \u2014 {opt['description']}"
+            lines.append(line)
+        if q.get("multiple"):
+            lines.append("_Toque para alternar e envie para confirmar._")
+    return lines
+
+
+def _q_kb(turn: dict) -> list[list[InlineKeyboardButton]]:
+    rows: list[list[InlineKeyboardButton]] = []
+    for q in turn["questions"]:
+        rid, qi = q["request_id"], q["qidx"]
+        sel = set(turn["qsel"].get((rid, qi)) or ())
+        if q.get("multiple"):
+            for i, opt in enumerate(q["options"]):
+                prefix = "\u2705 " if i in sel else ""
+                rows.append([InlineKeyboardButton(prefix + _btn_label(opt.get("label")), callback_data=f"qt:{rid}:{qi}:{i}")])
+            rows.append([
+                InlineKeyboardButton("\u2705 Enviar", callback_data=f"qs:{rid}"),
+                InlineKeyboardButton("\u274c Rejeitar", callback_data=f"qr:{rid}"),
+            ])
+        else:
+            for i, opt in enumerate(q["options"]):
+                rows.append([InlineKeyboardButton(_btn_label(opt.get("label")), callback_data=f"qo:{rid}:{qi}:{i}")])
+            row: list[InlineKeyboardButton] = []
+            if q.get("custom"):
+                row.append(InlineKeyboardButton("\u270f\ufe0f Digitar resposta", callback_data=f"qc:{rid}:{qi}"))
+            row.append(InlineKeyboardButton("\u274c Rejeitar", callback_data=f"qr:{rid}"))
+            rows.append(row)
+    if turn["perm_queue"]:
+        p = turn["perm_queue"][0]
+        rows.append([
+            InlineKeyboardButton("\u2705 Uma vez", callback_data=f"perm:{p['sid']}:{p['id']}:once"),
+            InlineKeyboardButton("\U0001f501 Sempre", callback_data=f"perm:{p['sid']}:{p['id']}:always"),
+            InlineKeyboardButton("\u274c Negar", callback_data=f"perm:{p['sid']}:{p['id']}:reject"),
+        ])
+    return rows
+
+
 def _render_running(turn: dict) -> tuple[str, InlineKeyboardMarkup | None]:
     lines = []
     if turn["todo"]:
         lines.append(f"\U0001f4cb *Plano:* {turn['todo']} passo{'s' if turn['todo'] != 1 else ''}")
-    kb = None
+    has_prompt = bool(turn["questions"]) or bool(turn["perm_queue"])
+    if turn["questions"]:
+        lines += _q_lines(turn)
     if turn["perm_queue"]:
         p = turn["perm_queue"][0]
         lines += ["", "\U0001f512 *Permiss\u00e3o pedida:*", _perm_desc(p)]
-        kb = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("\u2705 Uma vez", callback_data=f"perm:{p['sid']}:{p['id']}:once"),
-                InlineKeyboardButton("\U0001f501 Sempre", callback_data=f"perm:{p['sid']}:{p['id']}:always"),
-                InlineKeyboardButton("\u274c Negar", callback_data=f"perm:{p['sid']}:{p['id']}:reject"),
-            ]
-        ])
-    else:
+    if not has_prompt:
         curr = turn["current"]
         if curr and curr.get("cmd"):
             lines += ["", f"\u26a1 *rodando:* {_code(curr['cmd'])}"]
@@ -296,6 +370,8 @@ def _render_running(turn: dict) -> tuple[str, InlineKeyboardMarkup | None]:
             lines += ["", curr["label"]]
         else:
             lines += ["", "\u23f3 *pensando\u2026*"]
+    rows = _q_kb(turn)
+    kb = InlineKeyboardMarkup(rows) if rows else None
     return "\n".join(lines), kb
 
 
@@ -549,6 +625,9 @@ async def _start_turn(update_or_chat, text: str):
         "user_msg_id": None,
         "streamed_len": 0,
         "perm_queue": deque(),
+        "questions": [],
+        "qsel": {},
+        "awaiting_custom": None,
         "typing_task": None,
         "stream_task": None,
     }
@@ -572,6 +651,9 @@ async def _finish_turn(chat_id: int):
     turn["done"] = True
     turn["elapsed"] = time.monotonic() - turn["started"]
     turn["current"] = None
+    turn["questions"] = []
+    turn["qsel"] = {}
+    turn["awaiting_custom"] = None
     _stop_typing(turn)
     _stop_stream(turn)
     await _flush_stream(turn)
@@ -648,6 +730,27 @@ async def _dispatch(event: dict):
         p = {"id": props.get("id"), "sid": sid, "permission": props.get("permission"), "title": props.get("title") or "", "pattern": props.get("pattern")}
         turn["perm_queue"].append(p)
         await _push_status(turn, force=True)
+    elif et == "question.asked":
+        rid = props.get("id") or ""
+        questions = props.get("questions") or []
+        qlen = len(questions)
+        for idx, q in enumerate(questions):
+            turn["questions"].append({
+                "request_id": rid,
+                "sid": sid,
+                "qidx": idx,
+                "qlen": qlen,
+                "header": q.get("header") or "",
+                "question": q.get("question") or "",
+                "options": q.get("options") or [],
+                "multiple": bool(q.get("multiple")),
+                "custom": q.get("custom", True),
+                "answer": None,
+            })
+        await _push_status(turn, force=True)
+    elif et == "question.rejected":
+        _drop_questions(turn, props.get("requestID") or props.get("id") or "")
+        await _push_status(turn, force=True)
     elif et == "message.updated":
         info = props.get("info") or {}
         if info.get("role") == "user":
@@ -684,6 +787,46 @@ async def _dispatch(event: dict):
             await _push_status(turn)
 
 
+def _drop_questions(turn: dict, request_id: str):
+    rid = request_id or ""
+    turn["questions"] = [q for q in turn["questions"] if q["request_id"] != rid]
+    turn["qsel"] = {k: v for k, v in turn["qsel"].items() if k[0] != rid}
+
+
+async def _submit_question(turn: dict, request_id: str) -> bool:
+    items = sorted(
+        (q for q in turn["questions"] if q["request_id"] == request_id),
+        key=lambda q: q["qidx"],
+    )
+    if not items:
+        return True
+    qlen = max(q["qlen"] for q in items)
+    answers: list = [None] * qlen
+    for q in items:
+        a = q.get("answer")
+        if not a:
+            return False
+        answers[q["qidx"]] = list(a)
+    if any(a is None for a in answers):
+        return False
+    ok = await oc_answer_question(request_id, answers)
+    _drop_questions(turn, request_id)
+    return ok
+
+
+async def _refresh_after_question(turn: dict):
+    if turn["questions"] or turn["perm_queue"]:
+        await _push_status(turn, force=True)
+    else:
+        try:
+            await _app_ref.bot.edit_message_reply_markup(
+                chat_id=turn["chat_id"], message_id=turn["status_msg_id"], reply_markup=None
+            )
+        except TelegramError:
+            pass
+        await _push_status(turn, force=True)
+
+
 # ---------------------------------------------------------------- handlers
 
 async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -693,7 +836,101 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if not text:
         return
+    chat_id = update.effective_chat.id
+    turn = TURNS.get(chat_id)
+    if turn and turn.get("awaiting_custom"):
+        rid, qi = turn.pop("awaiting_custom")
+        item = next((q for q in turn["questions"] if q["request_id"] == rid and q["qidx"] == qi), None)
+        if item:
+            item["answer"] = [text]
+            ok = await _submit_question(turn, rid)
+            await update.message.reply_text(
+                "\u2705 *Resposta enviada ao opencode.*" if ok else
+                "\u274c *Falha ao enviar resposta ao opencode.*",
+                parse_mode="Markdown",
+            )
+            await _refresh_after_question(turn)
+            return
     await _start_turn(update, text)
+
+
+def _find_qitem(turn: dict, rid: str, qi: int | None = None) -> dict | None:
+    for q in turn["questions"]:
+        if q["request_id"] == rid and (qi is None or q["qidx"] == qi):
+            return q
+    return None
+
+
+async def cb_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if OWNER_ID and query.from_user.id != OWNER_ID:
+        await query.answer("Access denied.", show_alert=True)
+        return
+    chat_id = update.effective_chat.id
+    turn = TURNS.get(chat_id)
+    if not turn:
+        await query.answer("Sess\u00e3o encerrada.", show_alert=True)
+        return
+    parts = query.data.split(":")
+    op, rid = parts[0], parts[1]
+
+    if op == "qo":
+        _, _, qi_s, idx_s = parts
+        qi, idx = int(qi_s), int(idx_s)
+        item = _find_qitem(turn, rid, qi)
+        if not item:
+            await query.answer("Pergunta j\u00e1 respondida.", show_alert=True)
+            return
+        item["answer"] = [item["options"][idx]["label"]]
+        ok = await _submit_question(turn, rid)
+        await query.answer("\u2705 Enviado!" if ok else "\u274c Falha ao enviar.")
+        await _refresh_after_question(turn)
+    elif op == "qt":
+        _, _, qi_s, idx_s = parts
+        qi, idx = int(qi_s), int(idx_s)
+        item = _find_qitem(turn, rid, qi)
+        if not item:
+            await query.answer("Pergunta j\u00e1 respondida.", show_alert=True)
+            return
+        sel = turn["qsel"].setdefault((rid, qi), set())
+        if idx in sel:
+            sel.discard(idx)
+        else:
+            sel.add(idx)
+        await query.answer()
+        await _push_status(turn, force=True)
+    elif op == "qs":
+        items = [q for q in turn["questions"] if q["request_id"] == rid]
+        missing = False
+        for q in items:
+            sel = turn["qsel"].get((rid, q["qidx"])) or set()
+            q["answer"] = [q["options"][i]["label"] for i in sorted(sel)] if sel else None
+            if not q["answer"]:
+                missing = True
+        if missing:
+            await query.answer("Selecione ao menos uma op\u00e7\u00e3o em cada pergunta.", show_alert=True)
+            return
+        ok = await _submit_question(turn, rid)
+        await query.answer("\u2705 Enviado!" if ok else "\u274c Falha ao enviar.")
+        await _refresh_after_question(turn)
+    elif op == "qc":
+        _, _, qi_s = parts
+        qi = int(qi_s)
+        item = _find_qitem(turn, rid, qi)
+        if not item:
+            await query.answer("Pergunta j\u00e1 respondida.", show_alert=True)
+            return
+        turn["awaiting_custom"] = (rid, qi)
+        await query.answer("\u270f\ufe0f Digite sua resposta")
+        await update.effective_chat.send_message(
+            "\u270f\ufe0f *Digite sua resposta:* mande o texto agora.",
+            parse_mode="Markdown",
+        )
+    elif op == "qr":
+        ok = await oc_reject_question(rid)
+        _drop_questions(turn, rid)
+        await query.answer("\u274c Rejeitada." if ok else "\u274c Falha ao rejeitar.")
+        await _refresh_after_question(turn)
 
 
 async def cb_permission(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1107,6 +1344,7 @@ def main():
     app.add_handler(CommandHandler(["cancel", "cancelar"], cmd_cancel))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CallbackQueryHandler(cb_permission, pattern=r"^perm:"))
+    app.add_handler(CallbackQueryHandler(cb_question, pattern=r"^q[ostcr]:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_chat))
     logger.info("=" * 44)
     logger.info("  Telegram opencode bot  v%s", VERSION)
