@@ -3,8 +3,10 @@ import os
 import json
 import time
 import signal
+import subprocess
 import logging
 import asyncio
+import html
 import re
 from collections import deque
 from datetime import datetime, timezone
@@ -22,6 +24,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
     MessageHandler,
+    PicklePersistence,
 )
 from telegram.ext import filters
 
@@ -34,7 +37,7 @@ OPENCODE_DIR = os.getenv("OPENCODE_DIR", str(Path.home()))
 OC_PORT = int(os.getenv("OPENCODE_SERVER_PORT", "4100"))
 OC_URL = os.getenv("OPENCODE_SERVER_URL", f"http://127.0.0.1:{OC_PORT}")
 
-VERSION = "1.2.1"
+VERSION = "1.6.0"
 
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
@@ -43,6 +46,7 @@ logger = logging.getLogger(__name__)
 _app_ref: Application | None = None
 _client: httpx.AsyncClient | None = None
 _server_proc: asyncio.subprocess.Process | None = None
+_we_started_server = False
 _stream_task: asyncio.Task | None = None
 TURNS: dict[int, dict] = {}
 
@@ -71,34 +75,58 @@ async def reject_unauthorized(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def oc_server_ok() -> bool:
     try:
-        r = await _client.get("/config")
+        r = await asyncio.wait_for(_client.get("/config"), timeout=7.0)
         return r.status_code == 200
     except Exception:
         return False
 
 
 async def oc_start_server():
-    global _server_proc
+    """Spawns `opencode serve`, logging its output to a file instead of discarding it,
+    so a failed boot can actually be diagnosed."""
+    global _server_proc, _we_started_server
+    log_path = Path(OPENCODE_DIR) / ".opencode_bot_server.log"
+    log_fh = open(log_path, "ab", buffering=0)
     proc = await asyncio.create_subprocess_exec(
         "opencode", "serve", "--port", str(OC_PORT), "--print-logs",
         cwd=OPENCODE_DIR,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
+        stdout=log_fh,
+        stderr=log_fh,
         start_new_session=True,
     )
     _server_proc = proc
-    for _ in range(60):
+    _we_started_server = True
+    for _ in range(200):
         if await oc_server_ok():
             logger.info("opencode server pronto na porta %d", OC_PORT)
             return
+        if proc.returncode is not None:
+            log_fh.close()
+            tail = ""
+            try:
+                tail = log_path.read_text(errors="replace")[-2000:]
+            except Exception:
+                pass
+            raise RuntimeError(f"opencode serve encerrou sozinho (code={proc.returncode}). Log:\n{tail}")
         await asyncio.sleep(0.5)
-    raise RuntimeError("opencode server não respondeu a tempo")
+    log_fh.close()
+    tail = ""
+    try:
+        tail = log_path.read_text(errors="replace")[-2000:]
+    except Exception:
+        pass
+    raise RuntimeError(f"opencode server não respondeu a tempo. Log:\n{tail}")
 
 
 async def oc_ensure_server():
     global _client
     if _client is None:
-        _client = httpx.AsyncClient(base_url=OC_URL, timeout=None)
+        # Finite timeouts: infinite ones let a hung server wedge every command forever.
+        # Read timeout is generous because prompts can legitimately take a while.
+        _client = httpx.AsyncClient(
+            base_url=OC_URL,
+            timeout=httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=10.0),
+        )
     try:
         if await oc_server_ok():
             logger.info("Conectado ao opencode server %s", OC_URL)
@@ -106,6 +134,143 @@ async def oc_ensure_server():
     except Exception:
         pass
     await oc_start_server()
+
+
+async def oc_stop_server():
+    """Terminate the opencode server process only if we're the ones who spawned it."""
+    global _server_proc
+    if _server_proc and _we_started_server and _server_proc.returncode is None:
+        try:
+            _server_proc.terminate()
+            await asyncio.wait_for(_server_proc.wait(), timeout=10)
+        except Exception:
+            try:
+                _server_proc.kill()
+            except Exception:
+                pass
+    _server_proc = None
+
+
+# ---------------------------------------------------------------- restart
+
+def _read_oc_port_from_env() -> tuple[int, str]:
+    """Lê a porta/URL do opencode server direto do .env (sem mexer em os.environ),
+    para que o /restart respeite uma mudança de porta feita em disco."""
+    port, url = OC_PORT, OC_URL
+    try:
+        from dotenv import dotenv_values
+        vals = dotenv_values(Path(__file__).parent / ".env")
+        raw = str(vals.get("OPENCODE_SERVER_PORT") or "").strip()
+        if raw.isdigit():
+            port = int(raw)
+        url = str(vals.get("OPENCODE_SERVER_URL") or "").strip() or f"http://127.0.0.1:{port}"
+    except Exception:
+        pass
+    return port, url
+
+
+async def _kill_opencode_servers(timeout: float = 15.0) -> bool:
+    """Derruba quaisquer processos `opencode serve --port ...` (incluindo órfãos
+    da porta antiga). Retorna True se nenhum sobrou ao final."""
+    targets: list[int] = []
+    for _ in range(3):
+        proc = await asyncio.create_subprocess_exec(
+            "pgrep", "-f", "opencode serve --port",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await proc.communicate()
+        targets = [int(x) for x in out.decode().split() if int(x) != os.getpid()]
+        if targets:
+            break
+        targets = []
+        await asyncio.sleep(0.3)
+    if not targets:
+        return True
+    for pid in targets:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        alive = []
+        for pid in targets:
+            try:
+                os.kill(pid, 0)
+                alive.append(pid)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                alive.append(pid)
+        if not alive:
+            return True
+        await asyncio.sleep(0.25)
+    for pid in targets:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    await asyncio.sleep(0.5)
+    return not targets or await _kill_opencode_servers(0.5)
+
+
+def _spawn_bot_process():
+    """Relaça o bot num processo destacado, com o mesmo run.sh com que foi iniciado,
+    para sobreviver ao encerramento do processo atual."""
+    bot_dir = Path(__file__).parent
+    log_path = bot_dir / "bot.log"
+    log_fh = open(log_path, "ab", buffering=0)
+    try:
+        proc = subprocess.Popen(
+            ["bash", "run.sh"],
+            cwd=str(bot_dir),
+            stdin=subprocess.DEVNULL,
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            close_fds=True,
+        )
+        logger.info("Processo do bot relaçado (pid=%d)", proc.pid)
+    finally:
+        log_fh.close()
+
+
+async def _perform_restart(chat_id: int):
+    """Executa o restart de verdade: troca de porta, derruba o servidor antigo,
+    sobe um novo na porta configurada, relaça o bot e encerra este processo."""
+    global OC_PORT, OC_URL, _client, _server_proc, _we_started_server
+
+    new_port, new_url = _read_oc_port_from_env()
+    try:
+        OC_PORT, OC_URL = new_port, new_url
+        if _client is not None:
+            await _client.aclose()
+            _client = None
+        _server_proc, _we_started_server = None, False
+
+        await _kill_opencode_servers()
+        await oc_ensure_server()
+
+        # O servidor recém-iniciado fica vivo; o post_shutdown não deve matá-lo.
+        _server_proc, _we_started_server = None, False
+
+        _spawn_bot_process()
+        await asyncio.sleep(1.5)
+    except Exception as e:
+        logger.exception("Falha durante o restart")
+        app = _app_ref
+        if app:
+            try:
+                msg = f"\u274c *Falha no restart:* `{e}`\n\nVerifique o log: `.opencode_bot_server.log`"
+                await app.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+            except Exception:
+                pass
+        return
+
+    app = _app_ref
+    if app:
+        await app.stop()
 
 
 async def oc_create_session() -> str:
@@ -162,7 +327,7 @@ def _load_mcp_cfg() -> dict:
     if not p.exists():
         return {}
     try:
-        data = json.loads(p.read_text())
+        data = json.loads(_strip_jsonc_comments(p.read_text()))
     except Exception:
         return {}
     return (data or {}).get("mcp") or {}
@@ -172,12 +337,39 @@ def _mcp_url(name: str) -> str:
     return (_load_mcp_cfg().get(name) or {}).get("url") or ""
 
 
+_JSONC_COMMENT_RE = re.compile(r"//.*?$|/\*.*?\*/", re.MULTILINE | re.DOTALL)
+
+
+def _strip_jsonc_comments(text: str) -> str:
+    return _JSONC_COMMENT_RE.sub("", text)
+
+
+def _has_jsonc_comments(text: str) -> bool:
+    return bool(_JSONC_COMMENT_RE.search(text))
+
+
 async def _mcp_set_server(name: str, url: str, headers: dict | None = None) -> str:
+    """Adds/updates an MCP server entry in opencode.jsonc.
+
+    NOTE: opencode.jsonc allows comments (it's JSONC), but Python's json module
+    doesn't round-trip them. Rewriting the file with json.dumps would silently
+    delete any comments a human put there. To avoid destroying data we refuse
+    to touch the file if comments are present, and we always keep a .bak copy
+    of whatever we do overwrite.
+    """
     p = _mcp_file()
+    raw = ""
     data = {}
     if p.exists():
+        raw = p.read_text()
+        if _has_jsonc_comments(raw):
+            return (
+                "\u26a0\ufe0f `opencode.jsonc` tem coment\u00e1rios e n\u00e3o posso reescrev\u00ea-lo sem "
+                "apag\u00e1-los (o parser JSON do Python n\u00e3o preserva coment\u00e1rios). "
+                "Edite o arquivo manualmente ou remova os coment\u00e1rios e tente de novo."
+            )
         try:
-            data = json.loads(p.read_text())
+            data = json.loads(raw) if raw.strip() else {}
         except Exception:
             data = {}
     mcp = data.setdefault("mcp", {})
@@ -194,6 +386,9 @@ async def _mcp_set_server(name: str, url: str, headers: dict | None = None) -> s
         return "\u274c sem URL \u2014 passe `--url <url>`"
     mcp[name] = cfg
     try:
+        if raw:
+            p.with_suffix(p.suffix + ".bak").write_text(raw)
+        p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
     except Exception as e:
         return f"\u274c falha ao gravar config: {e}"
@@ -239,9 +434,19 @@ async def oc_abort(sid: str):
         pass
 
 
+async def _kill_all_turns(chat_id: int | None = None):
+    for cid in [chat_id] if chat_id else list(TURNS.keys()):
+        turn = TURNS.pop(cid, None)
+        if turn and turn.get("sid"):
+            try:
+                await oc_abort(turn["sid"])
+            except Exception:
+                pass
+
+
 def _find_turn(sid: str) -> dict | None:
     for t in TURNS.values():
-        if t["sid"] == sid:
+        if t.get("sid") == sid:
             return t
     return None
 
@@ -249,14 +454,14 @@ def _find_turn(sid: str) -> dict | None:
 # ---------------------------------------------------------------- rendering
 
 TOOL_ICONS = {
-    "read": "\U0001f4d6",     # 📖 leu
-    "write": "\u2795",        # ➕ criou/escreveu
-    "edit": "\u270f\ufe0f",   # ✏️ editou
-    "bash": "\u26a1",         # ⚡ rodou comando
-    "glob": "\U0001f50d",     # 🔍 buscou arquivos
+    "read": "\U0001f4d6",     # \U0001f4d6 leu
+    "write": "\u2795",        # \u2795 criou/escreveu
+    "edit": "\u270f\ufe0f",   # \u270f\ufe0f editou
+    "bash": "\u26a1",         # \u26a1 rodou comando
+    "glob": "\U0001f50d",     # \U0001f50d buscou arquivos
     "grep": "\U0001f50d",
-    "mcp": "\U0001f916",      # 🤖 mcp
-    "todo": "\U0001f4cb",     # 📋
+    "mcp": "\U0001f916",      # \U0001f916 mcp
+    "todo": "\U0001f4cb",     # \U0001f4cb
 }
 
 
@@ -272,18 +477,51 @@ def _fmt_path(path: str | None) -> str:
 def _perm_desc(p: dict) -> str:
     pat = p.get("pattern")
     pat_str = ", ".join(pat) if isinstance(pat, list) else (pat or "")
-    title = p.get("title") or p.get("permission") or "permissão"
+    title = p.get("title") or p.get("permission") or "permiss\u00e3o"
     if pat_str:
         return f"{title}: `{pat_str}`"
     return f"`{title}`"
 
 
 def _code(s: str) -> str:
-    return f"`{(s or '').replace('`', "'")}`"
+    # Kept as a plain statement (not a nested-quote f-string) so this runs on
+    # Python < 3.12 too -- PEP 701 (same-quote nesting in f-strings) is 3.12+.
+    escaped = (s or "").replace("`", "'")
+    return "`" + escaped + "`"
+
+
+# ---- secret redaction -------------------------------------------------
+# Anything the agent runs (grep/curl/etc) gets echoed into Telegram, which
+# means a raw API key or token found on disk ends up permanently in the
+# chat's message history. This is a best-effort mask, not a guarantee --
+# it catches the common shapes (key=..., Bearer ..., long hex blobs, known
+# provider prefixes) but a determined secret in an unusual format can still
+# slip through. Treat the Telegram history as sensitive regardless.
+_SECRET_PATTERNS = [
+    re.compile(r"(?i)\b((?:api[_-]?key|apikey|access[_-]?token|auth[_-]?token|secret|password|passwd|token)\s*[:=]\s*['\"]?)([A-Za-z0-9\-_\.]{6,})"),
+    re.compile(r"(?i)(bearer\s+)([A-Za-z0-9\-_\.]{10,})"),
+    re.compile(r"\b[0-9A-Fa-f]{32,64}\b"),          # steam keys, md5/sha hashes, generic hex secrets
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),             # AWS access key id
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),   # GitHub tokens
+    re.compile(r"\bsk-[A-Za-z0-9]{16,}\b"),          # OpenAI/Anthropic-style keys
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9\-]{10,}\b"),  # Slack tokens
+]
+
+
+def _redact_secrets(s: str) -> str:
+    if not s:
+        return s
+    out = s
+    for pat in _SECRET_PATTERNS:
+        if pat.groups:
+            out = pat.sub(lambda m: m.group(1) + "\u2588\u2588\u2588MASKED\u2588\u2588\u2588", out)
+        else:
+            out = pat.sub("\u2588\u2588\u2588MASKED\u2588\u2588\u2588", out)
+    return out
 
 
 def _tail_out(s: str, n: int = 450) -> str:
-    s = (s or "").strip().replace("```", "'''")
+    s = _redact_secrets((s or "").strip().replace("```", "'''"))
     if not s:
         return ""
     if len(s) > n:
@@ -342,9 +580,14 @@ def _q_kb(turn: dict) -> list[list[InlineKeyboardButton]]:
     if turn["perm_queue"]:
         p = turn["perm_queue"][0]
         rows.append([
-            InlineKeyboardButton("\u2705 Uma vez", callback_data=f"perm:{p['sid']}:{p['id']}:once"),
-            InlineKeyboardButton("\U0001f501 Sempre", callback_data=f"perm:{p['sid']}:{p['id']}:always"),
-            InlineKeyboardButton("\u274c Negar", callback_data=f"perm:{p['sid']}:{p['id']}:reject"),
+            # Note: only the permission id goes in callback_data. turn["sid"]
+            # is already known server-side -- putting it here too used to push
+            # this well past Telegram's 64-byte callback_data limit, which
+            # made Telegram silently reject the button and the whole permission
+            # prompt would never render (looked like the bot just hung).
+            InlineKeyboardButton("\u2705 Uma vez", callback_data=f"perm:{p['id']}:once"),
+            InlineKeyboardButton("\U0001f501 Sempre", callback_data=f"perm:{p['id']}:always"),
+            InlineKeyboardButton("\u274c Negar", callback_data=f"perm:{p['id']}:reject"),
         ])
     return rows
 
@@ -362,7 +605,7 @@ def _render_running(turn: dict) -> tuple[str, InlineKeyboardMarkup | None]:
     if not has_prompt:
         curr = turn["current"]
         if curr and curr.get("cmd"):
-            lines += ["", f"\u26a1 *rodando:* {_code(curr['cmd'])}"]
+            lines += ["", f"\u26a1 *rodando:* {_code(_redact_secrets(curr['cmd']))}"]
             out = _tail_out(curr.get("out"), 450)
             if out:
                 lines += ["```", out, "```"]
@@ -378,11 +621,11 @@ def _render_running(turn: dict) -> tuple[str, InlineKeyboardMarkup | None]:
 def _summary(turn: dict) -> list[str]:
     out = []
     if turn["reads"]:
-        out.append(f"\U0001f4d6 *leu:* " + ", ".join(sorted(f"`{_fmt_path(x)}`" for x in turn["reads"])))
+        out.append("\U0001f4d6 *leu:* " + ", ".join(sorted(f"`{_fmt_path(x)}`" for x in turn["reads"])))
     if turn["writes"]:
-        out.append(f"\u2795 *criou:* " + ", ".join(sorted(f"`{_fmt_path(x)}`" for x in turn["writes"])))
+        out.append("\u2795 *criou:* " + ", ".join(sorted(f"`{_fmt_path(x)}`" for x in turn["writes"])))
     if turn["edits"]:
-        out.append(f"\u270f\ufe0f *editou:* " + ", ".join(sorted(f"`{_fmt_path(x)}`" for x in turn["edits"])))
+        out.append("\u270f\ufe0f *editou:* " + ", ".join(sorted(f"`{_fmt_path(x)}`" for x in turn["edits"])))
     if turn["rejected"]:
         out.append(f"\u274c *negado:* {turn['rejected']} permiss\u00f5e(s)")
     return out
@@ -398,7 +641,7 @@ def _trace_lines(turn: dict, max_steps: int = 40, max_out: int = 500) -> list[st
     if skipped:
         lines.append(f"({skipped} passo{'s' if skipped != 1 else ''} anterior{'is' if skipped != 1 else ''} omitido{'s' if skipped != 1 else ''})")
     for i, step in enumerate(show, 1 + skipped):
-        lines += ["", f"{i}) {_code('$ ' + step['cmd'])}"]
+        lines += ["", f"{i}) {_code(_redact_secrets('$ ' + step['cmd']))}"]
         out = _tail_out(step.get("out"), max_out)
         if out:
             lines += ["```", out, "```"]
@@ -419,16 +662,154 @@ def _render_think(turn: dict, elapsed: float) -> str:
     total = "\n".join(lines)
     if len(total) > 3950:
         total = total[:3950] + "\n\u2026"
-    return total
+    return _expandable_html(_telegram_html(total, max_len=3950))
+
+
+_MD_FENCE_RE = re.compile(r"```([a-zA-Z0-9_+\-.]*)[ \t]*\r?\n(.*?)```", re.DOTALL)
+_MD_INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
+_MD_STRIKE_RE = re.compile(r"~~(.+?)~~", re.DOTALL)
+_MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
+_MD_ITAL_A_RE = re.compile(r"(?<![\w*])\*([^*\n]+)\*(?![\w*])")
+_MD_ITAL_U_RE = re.compile(r"(?<![\w_])_([^_\n]+)_(?![\w_])")
+_MD_LINK_RE = re.compile(r"\[([^\]\n]+)\]\(([^)\s]+)\)")
+_MD_HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(.+)$", re.MULTILINE)
+
+_TAG_TOKEN_RE = re.compile(r"(</?[a-zA-Z][a-zA-Z0-9-]*(?:\s+[^<>]*?)?/?>)|([^<]+)", re.DOTALL)
+_ENTITY_RE = re.compile(r"&(?:#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6}|[a-zA-Z][a-zA-Z0-9]{1,31});")
+
+_ALLOWED_TAGS = {
+    "b": "b", "i": "i", "u": "u", "s": "s",
+    "strong": "b", "em": "i", "ins": "u", "strike": "s", "del": "s",
+    "code": "code", "pre": "pre", "blockquote": "blockquote",
+    "p": "p", "br": "br", "a": "a", "tg-spoiler": "tg-spoiler",
+}
+_VOID_TAGS = {"br"}
+
+
+def _escape_html_text(s: str) -> str:
+    """Escapa & < > para entidades, preservando entidades já válidas."""
+    out, i = [], 0
+    for m in _ENTITY_RE.finditer(s):
+        out.append(html.escape(s[i:m.start()], quote=False))
+        out.append(m.group(0))
+        i = m.end()
+    out.append(html.escape(s[i:], quote=False))
+    return "".join(out)
+
+
+def _telegram_html(text: str, max_len: int | None = None) -> str:
+    """Converte markdown + HTML do assistente em HTML seguro e balanceado
+    para o parse_mode='HTML' do Telegram.
+
+    Etapas:
+      1) markdown -> HTML (fenced code, `código`, **negrito**, *itálico*,
+         ~~riscado~~, [link](url) só http/https, cabeçalhos #..######);
+      2) sanitização com whitelist de tags Telegram, normalização de nomes,
+         descarte de atributos (excepto <a href> seguro), balanceamento de
+         tags (fechando/descartando órfãs) e corte seguro em max_len.
+    """
+    def _fence(m):
+        lang = m.group(1)
+        cls = f' class="language-{lang}"' if lang else ""
+        return f"<pre><code{cls}>{html.escape(m.group(2), quote=False)}</code></pre>"
+
+    def _link(m):
+        url = m.group(2).strip()
+        if not re.match(r"^https?://", url, re.I):
+            return m.group(0)
+        return f'<a href="{html.escape(url, quote=True)}">{html.escape(m.group(1), quote=False)}</a>'
+
+    # 1) markdown -> html (sem escapar o texto inteiro antes)
+    h = _MD_FENCE_RE.sub(_fence, text)
+    h = _MD_INLINE_CODE_RE.sub(lambda m: f"<code>{html.escape(m.group(1), quote=False)}</code>", h)
+    h = _MD_LINK_RE.sub(_link, h)
+    h = _MD_STRIKE_RE.sub(lambda m: f"<s>{m.group(1)}</s>", h)
+    h = _MD_BOLD_RE.sub(lambda m: f"<b>{m.group(1)}</b>", h)
+    h = _MD_ITAL_A_RE.sub(lambda m: f"<i>{m.group(1)}</i>", h)
+    h = _MD_ITAL_U_RE.sub(lambda m: f"<i>{m.group(1)}</i>", h)
+    h = _MD_HEADING_RE.sub(lambda m: f"<b>{m.group(2)}</b>", h)
+
+    # 2) sanitizar + balancear + cortar
+    out: list[str] = []
+    stack: list[str] = []
+    clipped = False
+    for m in _TAG_TOKEN_RE.finditer(h):
+        tag_part, text_part = m.group(1), m.group(2)
+        if text_part is not None:
+            rendered = _escape_html_text(text_part)
+            if max_len is not None and len("".join(out)) + len(rendered) > max_len:
+                out.append("\u2026")
+                clipped = True
+                break
+            out.append(rendered)
+            continue
+        tm = re.match(r"</?([a-zA-Z][a-zA-Z0-9-]*)", tag_part)
+        if not tm:
+            out.append(_escape_html_text(tag_part))
+            continue
+        name = tm.group(1).lower()
+        canon = _ALLOWED_TAGS.get(name)
+        closing = tag_part.startswith("</")
+        if canon is None:
+            out.append(_escape_html_text(tag_part))
+            continue
+        if closing:
+            if canon in stack:
+                while stack and stack[-1] != canon:
+                    out.append(f"</{stack.pop()}>")
+                if stack:
+                    stack.pop()
+                out.append(f"</{canon}>")
+            else:
+                out.append(_escape_html_text(tag_part))
+            continue
+        rendered_tag = f"<{canon}>"
+        if name == "a":
+            href = re.search(r'\bhref\s*=\s*("([^"]*)"|\'([^\']*)\'|([^\s>]+))', tag_part, re.I)
+            url = (href.group(2) or href.group(3) or href.group(4)) if href else ""
+            if not re.match(r"^https?://", url or "", re.I):
+                out.append(_escape_html_text(tag_part))
+                continue
+            rendered_tag = f'<a href="{html.escape(url, quote=True)}">'
+        if max_len is not None and len("".join(out)) + len(rendered_tag) > max_len:
+            out.append("\u2026")
+            clipped = True
+            break
+        out.append(rendered_tag)
+        if canon not in _VOID_TAGS:
+            stack.append(canon)
+
+    for canon in reversed(stack):
+        out.append(f"</{canon}>")
+    result = "".join(out)
+    if clipped and max_len is not None and len(result) > max_len:
+        cut = result.rfind("<", 0, max_len)
+        if cut > max_len - 64:
+            result = result[:cut] + "\u2026"
+        else:
+            result = result[:max_len].rstrip() + "\u2026"
+    return result
+
+
+def _plain_text(html_text: str) -> str:
+    """Remove tags e desfaz entidades: texto limpo, sem HTML cru."""
+    if not html_text:
+        return ""
+    cleaned = html.unescape(re.sub(r"<[^>]*>", "", html_text))
+    return re.sub(r"</?[a-zA-Z][^>]*>", "", cleaned)
+
+
+def _expandable_html(html_text: str) -> str:
+    return f"<blockquote expandable>{html_text}</blockquote>"
 
 
 def _result_text(turn: dict) -> tuple[str, str]:
-    body = (turn["out_text"] or "").strip().replace("```", "'''")
+    body = (turn["out_text"] or "").strip()
     if not body:
-        return "_escrevendo\u2026_", ""
-    if len(body) > 3900:
-        return "\u2026" + body[-3900:], ""
-    return body, ""
+        return "escrevendo\u2026", ""
+    if len(body) > 3800:
+        body = "\u2026" + body[-3800:]
+    return _telegram_html(body, max_len=3800), ""
 
 
 # ---------------------------------------------------------------- turn plumbing
@@ -442,26 +823,43 @@ async def _push_status(turn: dict, force: bool = False):
     if turn.get("done"):
         text = _render_think(turn, turn.get("elapsed", 0.0))
         kb = None
+        parse_mode = "HTML"
     else:
         text, kb = _render_running(turn)
+        parse_mode = "Markdown"
     try:
         await app.bot.edit_message_text(
             chat_id=turn["chat_id"],
             message_id=turn["status_msg_id"],
             text=text,
-            parse_mode="Markdown",
+            parse_mode=parse_mode,
             reply_markup=kb,
         )
-    except TelegramError:
+    except TelegramError as e1:
         try:
             await app.bot.edit_message_text(
                 chat_id=turn["chat_id"],
                 message_id=turn["status_msg_id"],
-                text=text,
+                text=_plain_text(text),
                 reply_markup=kb,
             )
-        except TelegramError:
-            pass
+        except TelegramError as e2:
+            # Both attempts failed with the same reply_markup -- if kb itself
+            # is the problem (e.g. a callback_data over Telegram's 64-byte
+            # limit), retrying with it again would just fail identically and
+            # the status message would silently stop updating, which looks
+            # to the user like the bot hung. Drop the buttons and show the
+            # text anyway so the state is at least visible.
+            logger.warning("Falha ao editar status (com botões): %s / %s", e1, e2)
+            if kb is not None:
+                try:
+                    await app.bot.edit_message_text(
+                        chat_id=turn["chat_id"],
+                        message_id=turn["status_msg_id"],
+                        text=text + "\n\n_(bot\u00f5es indispon\u00edveis nesta atualiza\u00e7\u00e3o)_",
+                    )
+                except TelegramError:
+                    pass
 
 
 def _start_typing(turn: dict):
@@ -493,17 +891,18 @@ async def _update_result(turn: dict, force: bool = False):
     if turn["result_msg_id"] is None:
         if not force and not turn["done"] and len(text.strip()) < STREAM_MIN:
             return
-        msg = await _app_ref.bot.send_message(turn["chat_id"], text, parse_mode="Markdown")
+        msg = await _app_ref.bot.send_message(turn["chat_id"], text, parse_mode="HTML")
         turn["result_msg_id"] = msg.message_id
     else:
         try:
             await _app_ref.bot.edit_message_text(
-                chat_id=turn["chat_id"], message_id=turn["result_msg_id"], text=text, parse_mode="Markdown"
+                chat_id=turn["chat_id"], message_id=turn["result_msg_id"], text=text, parse_mode="HTML"
             )
         except TelegramError:
             try:
                 await _app_ref.bot.edit_message_text(
-                    chat_id=turn["chat_id"], message_id=turn["result_msg_id"], text=text
+                    chat_id=turn["chat_id"], message_id=turn["result_msg_id"],
+                    text=_plain_text(text),
                 )
             except TelegramError:
                 pass
@@ -607,29 +1006,14 @@ def _record_tool(turn: dict, part: dict):
         turn["current"] = {"label": label, "out": ""} if status == "running" else None
 
 
-async def _start_turn(update_or_chat, text: str):
-    """Runs one opencode turn for a chat. update can be a message update."""
-    chat_id = update_or_chat.effective_chat.id if hasattr(update_or_chat, "effective_chat") else update_or_chat
-    user_id = update_or_chat.effective_user.id if hasattr(update_or_chat, "effective_user") else None
-
-    if chat_id in TURNS:
-        await update_or_chat.message.reply_text("\u23f3 Ainda estou processando a mensagem anterior\u2026")
-        return
-
-    # reuse the persistent session, or create one
-    data = _app_ref.bot_data.setdefault("chats", {})
-    chat_cfg = data.setdefault(chat_id, {})
-    sid = chat_cfg.get("sid")
-    if not sid:
-        sid = await oc_create_session()
-        chat_cfg["sid"] = sid
-
-    placeholder = await update_or_chat.message.reply_text("\U0001f4ad *opencode pensando\u2026*", parse_mode="Markdown")
-
-    turn = {
+def _new_turn_skeleton(chat_id: int) -> dict:
+    """A turn dict with everything needed to occupy TURNS[chat_id] synchronously,
+    before any `await` happens, so a second incoming message can't race past the
+    'is a turn already running' check."""
+    return {
         "chat_id": chat_id,
-        "sid": sid,
-        "status_msg_id": placeholder.message_id,
+        "sid": None,
+        "status_msg_id": None,
         "result_msg_id": None,
         "result_last": "",
         "started": time.monotonic(),
@@ -645,6 +1029,7 @@ async def _start_turn(update_or_chat, text: str):
         "process_seen": set(),
         "current": None,
         "out_text": "",
+        "reasoning_part_ids": set(),
         "user_msg_id": None,
         "streamed_len": 0,
         "perm_queue": deque(),
@@ -654,15 +1039,49 @@ async def _start_turn(update_or_chat, text: str):
         "typing_task": None,
         "stream_task": None,
     }
+
+
+async def _start_turn(update_or_chat, text: str):
+    """Runs one opencode turn for a chat. update can be a message update."""
+    chat_id = update_or_chat.effective_chat.id if hasattr(update_or_chat, "effective_chat") else update_or_chat
+
+    if chat_id in TURNS:
+        await update_or_chat.message.reply_text("\u23f3 Ainda estou processando a mensagem anterior\u2026")
+        return
+
+    # Reserve the slot for this chat *before* any await, closing the race where
+    # two fast messages both see "no turn running" and both start one.
+    turn = _new_turn_skeleton(chat_id)
     TURNS[chat_id] = turn
-    _start_typing(turn)
-    turn["stream_task"] = asyncio.create_task(_stream_loop(turn))
 
     try:
+        data = _app_ref.bot_data.setdefault("chats", {})
+        chat_cfg = data.setdefault(chat_id, {})
+        sid = chat_cfg.get("sid")
+        if not sid:
+            sid = await oc_create_session()
+            chat_cfg["sid"] = sid
+        turn["sid"] = sid
+
+        placeholder = await update_or_chat.message.reply_text("\U0001f4ad *opencode pensando\u2026*", parse_mode="Markdown")
+        turn["status_msg_id"] = placeholder.message_id
+        turn["started"] = time.monotonic()
+
+        _start_typing(turn)
+        turn["stream_task"] = asyncio.create_task(_stream_loop(turn))
+
         await oc_send_message(sid, text, model=chat_cfg.get("model"), agent=chat_cfg.get("agent"))
     except Exception as e:
-        logger.exception("Falha ao enviar prompt")
+        logger.exception("Falha ao iniciar turn")
         turn["out_text"] = f"\u274c Falha ao enviar para o opencode: {e}"
+        if turn["status_msg_id"] is None:
+            # We never even got the placeholder message out -- send one now so
+            # _finish_turn has something to edit.
+            try:
+                placeholder = await update_or_chat.message.reply_text("\U0001f4ad ...")
+                turn["status_msg_id"] = placeholder.message_id
+            except Exception:
+                pass
         await _finish_turn(chat_id)
 
 
@@ -681,49 +1100,51 @@ async def _finish_turn(chat_id: int):
     _stop_stream(turn)
 
     app = _app_ref
-    # ---- balão do resultado ----
-    answer = (turn["out_text"] or "").strip().replace("```", "'''")
+    # ---- bal\u00e3o do resultado (sem blockquote) ----
+    answer = (turn["out_text"] or "").strip()
     if not answer:
         answer = "(sem resposta)"
-    limit = 3900
-    if len(answer) > limit:
-        first_body, rest = answer[: limit], answer[limit:]
-    else:
-        first_body, rest = answer, ""
+    bodies = [_telegram_html(c, max_len=3500) for c in _split_text(answer, limit=3500)]
+    first_body = bodies[0]
     if turn["result_msg_id"] is None:
-        msg = await app.bot.send_message(chat_id=chat_id, text=first_body, parse_mode="Markdown")
+        msg = await app.bot.send_message(chat_id=chat_id, text=first_body, parse_mode="HTML")
         turn["result_msg_id"] = msg.message_id
     else:
         try:
             await app.bot.edit_message_text(
-                chat_id=chat_id, message_id=turn["result_msg_id"], text=first_body, parse_mode="Markdown"
+                chat_id=chat_id, message_id=turn["result_msg_id"], text=first_body, parse_mode="HTML"
             )
         except TelegramError:
             try:
                 await app.bot.edit_message_text(
-                    chat_id=chat_id, message_id=turn["result_msg_id"], text=first_body
+                    chat_id=chat_id, message_id=turn["result_msg_id"],
+                    text=_plain_text(first_body),
                 )
             except TelegramError:
                 pass
-    for chunk in _split_text(rest):
+    for body in bodies[1:]:
         try:
-            await app.bot.send_message(chat_id=chat_id, text=chunk, parse_mode="Markdown")
+            await app.bot.send_message(chat_id=chat_id, text=body, parse_mode="HTML")
         except TelegramError:
-            await app.bot.send_message(chat_id=chat_id, text=chunk)
+            try:
+                await app.bot.send_message(chat_id=chat_id, text=_plain_text(body))
+            except TelegramError:
+                pass
 
-    # ---- balão do pensamento ----
-    text = _render_think(turn, turn["elapsed"])
-    try:
-        await app.bot.edit_message_text(
-            chat_id=chat_id, message_id=turn["status_msg_id"], text=text, parse_mode="Markdown"
-        )
-    except TelegramError:
+    # ---- bal\u00e3o do pensamento (expandable blockquote) ----
+    if turn["status_msg_id"] is not None:
+        text = _render_think(turn, turn["elapsed"])
         try:
             await app.bot.edit_message_text(
-                chat_id=chat_id, message_id=turn["status_msg_id"], text=text
+                chat_id=chat_id, message_id=turn["status_msg_id"], text=text, parse_mode="HTML"
             )
         except TelegramError:
-            pass
+            try:
+                await app.bot.edit_message_text(
+                    chat_id=chat_id, message_id=turn["status_msg_id"], text=_plain_text(text)
+                )
+            except TelegramError:
+                pass
 
 
 def _split_text(text: str, limit: int = 4000) -> list[str]:
@@ -803,12 +1224,17 @@ async def _dispatch(event: dict):
             turn["user_msg_id"] = info.get("id")
     elif et == "session.status":
         st = props.get("status", {})
-        if st.get("type") == "busy":
+        stype = st.get("type")
+        if stype == "busy":
             turn["busy"] = True
             if not turn["typing_task"]:
                 _start_typing(turn)
-        elif st.get("type") == "idle":
-            pass
+        elif stype == "idle":
+            # Some opencode versions signal completion only via session.status
+            # (idle) and never emit a separate session.idle event. Finishing
+            # here too (finish is idempotent via TURNS.pop) avoids a turn that
+            # never closes.
+            await _finish_turn(turn["chat_id"])
     elif et == "session.idle":
         await _finish_turn(turn["chat_id"])
     elif et == "session.error":
@@ -820,10 +1246,22 @@ async def _dispatch(event: dict):
         await _push_status(turn)
     elif et == "message.part.updated":
         part = props.get("part") or {}
-        if part.get("type") == "tool":
+        ptype = part.get("type")
+        if ptype == "tool":
             _record_tool(turn, part)
             await _push_status(turn)
+        elif ptype == "reasoning":
+            # Remember this part's id so the delta handler below can tell the
+            # model's internal chain-of-thought apart from its real answer --
+            # both can arrive as field="text" deltas, and without this the
+            # reasoning gets appended straight into the final answer bubble.
+            pid = part.get("id")
+            if pid:
+                turn["reasoning_part_ids"].add(pid)
     elif et == "message.part.delta":
+        part_id = props.get("partID") or props.get("partId") or props.get("id")
+        if part_id and part_id in turn["reasoning_part_ids"]:
+            return
         if props.get("field") == "text" and props.get("messageID") != turn.get("user_msg_id"):
             turn["out_text"] += props.get("delta", "")
     elif et == "file.edited":
@@ -984,7 +1422,7 @@ async def cb_permission(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if OWNER_ID and query.from_user.id != OWNER_ID:
         await query.answer("Access denied.", show_alert=True)
         return
-    _, sid, perm_id, response = query.data.split(":")
+    _, perm_id, response = query.data.split(":", 2)
     chat_id = update.effective_chat.id
     turn = TURNS.get(chat_id)
     if not turn:
@@ -994,12 +1432,11 @@ async def cb_permission(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Permiss\u00e3o j\u00e1 respondida.", show_alert=True)
         return
     turn["perm_queue"].popleft()
-    await oc_answer_permission(sid, perm_id, response)
+    await oc_answer_permission(turn["sid"], perm_id, response)
     await query.answer()
     if turn["perm_queue"]:
         await _push_status(turn, force=True)
     else:
-        # remove the keyboard, keep status
         try:
             await context.bot.edit_message_reply_markup(chat_id=chat_id, message_id=turn["status_msg_id"], reply_markup=None)
         except TelegramError:
@@ -1035,6 +1472,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  /mcp \u2014 gerencia servidores MCP (list/add/auth/logout/debug)\n"
         "  /version \u2014 vers\u00e3o instalada\n"
         "  /status \u2014 estado do servidor\n"
+        "  /restart \u2014 reinicia servidor e bot (nenhuma resposta em andamento \u00e9 perdida)\n"
         "  /help \u2014 esta ajuda (alias /ajuda)",
         parse_mode="Markdown",
     )
@@ -1195,20 +1633,25 @@ async def cmd_mcp(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if i + 1 < len(rest):
                 url = rest[i + 1]
         msg = await _mcp_set_server(name, url)
-        await update.message.reply_text(msg)
+        await update.message.reply_text(msg, parse_mode="Markdown")
         return
 
     if sub == "token":
         if len(args) < 3:
             await update.message.reply_text(
                 "Uso: `/mcp token <nome> <TOKEN>`\n\n"
-                "Grava o header `Authorization: Bearer <TOKEN>` no servidor MCP. Para o Todoist, pegue seu API token em Todoist \u2192 Settings \u2192 Integrations \u2192 Developer.",
+                "Grava o header `Authorization: Bearer <TOKEN>` no servidor MCP. Para o Todoist, pegue seu API token em Todoist \u2192 Settings \u2192 Integrations \u2192 Developer.\n\n"
+                "\u26a0\ufe0f O token fica vis\u00edvel no hist\u00f3rico deste chat do Telegram \u2014 apague a mensagem depois de enviar, se puder.",
                 parse_mode="Markdown",
             )
             return
         name, token = args[1], args[2]
         msg = await _mcp_set_server(name, _mcp_url(name), headers={"Authorization": f"Bearer {token}"})
-        await update.message.reply_text(msg + "\n\n_(o token fica salvo em ~/.config/opencode/opencode.jsonc)_")
+        await update.message.reply_text(msg + "\n\n_(o token fica salvo em ~/.config/opencode/opencode.jsonc)_", parse_mode="Markdown")
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
         return
 
     if sub == "auth":
@@ -1332,6 +1775,20 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
+async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await reject_unauthorized(update, context)
+        return
+    chat_id = update.effective_chat.id
+    await _kill_all_turns(chat_id)
+    await update.message.reply_text(
+        "\U0001f501 *Reiniciando o servidor e o bot*\n\n"
+        "Derrubando o servidor antigo...",
+        parse_mode="Markdown",
+    )
+    await _perform_restart(chat_id)
+
+
 # ---------------------------------------------------------------- bootstrap
 
 async def post_init(app: Application):
@@ -1346,12 +1803,13 @@ async def post_init(app: Application):
         BotCommand("cancel", "Interrompe a resposta"),
         BotCommand("models", "Modelos (ou define modelo)"),
         BotCommand("agents", "Agentes (ou define agente)"),
-        BotCommand("sessions", "Listar/retomar sessões"),
-        BotCommand("summarize", "Resumo da sessão"),
+        BotCommand("sessions", "Listar/retomar sess\u00f5es"),
+        BotCommand("summarize", "Resumo da sess\u00e3o"),
         BotCommand("stats", "Uso e custo"),
         BotCommand("mcp", "Servidores MCP"),
-        BotCommand("version", "Versão do opencode"),
+        BotCommand("version", "Vers\u00e3o do opencode"),
         BotCommand("status", "Estado do servidor"),
+        BotCommand("restart", "Reiniciar servidor e bot"),
     ])
     chat_id = _get_owner_chat()
     if chat_id:
@@ -1365,16 +1823,38 @@ async def post_init(app: Application):
             logger.exception("Falha ao enviar mensagem de boot")
 
 
+async def post_shutdown(app: Application):
+    """Cleans up the background event stream task and, if we spawned the
+    opencode server ourselves, terminates it instead of leaving it orphaned."""
+    global _stream_task
+    if _stream_task:
+        _stream_task.cancel()
+        try:
+            await _stream_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        _stream_task = None
+    for turn in list(TURNS.values()):
+        _stop_typing(turn)
+        _stop_stream(turn)
+    await oc_stop_server()
+    if _client:
+        await _client.aclose()
+
+
 def main():
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN n\u00e3o configurado. Crie um .env com BOT_TOKEN=seu_token")
         return
     request = HTTPXRequest(connect_timeout=30, read_timeout=30, write_timeout=30, pool_timeout=10)
+    persistence = PicklePersistence(filepath=str(Path(OPENCODE_DIR) / ".opencode_bot_persistence.pkl"))
     app = (
         Application.builder()
         .token(BOT_TOKEN)
         .request(request)
+        .persistence(persistence)
         .post_init(post_init)
+        .post_shutdown(post_shutdown)
         .build()
     )
     app.add_handler(CommandHandler("start", cmd_start))
@@ -1389,6 +1869,7 @@ def main():
     app.add_handler(CommandHandler(["new", "novo"], cmd_new))
     app.add_handler(CommandHandler(["cancel", "cancelar"], cmd_cancel))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("restart", cmd_restart))
     app.add_handler(CallbackQueryHandler(cb_permission, pattern=r"^perm:"))
     app.add_handler(CallbackQueryHandler(cb_question, pattern=r"^q[ostcr]:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_chat))
