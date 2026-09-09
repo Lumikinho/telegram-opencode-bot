@@ -6,6 +6,7 @@ import signal
 import subprocess
 import logging
 import asyncio
+import base64
 import html
 import re
 from collections import deque
@@ -31,13 +32,16 @@ from telegram.ext import filters
 load_dotenv(Path(__file__).parent / ".env")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+OWNER_ID = int(os.getenv("OWNER_ID", "0") or "0")
+if not OWNER_ID:
+    logger.error("OWNER_ID não configurado — recusando iniciar por segurança.")
+    raise SystemExit("OWNER_ID obrigatório. Defina-o no .env.")
 CHAT_ID = os.getenv("CHAT_ID", "")
 OPENCODE_DIR = os.getenv("OPENCODE_DIR", str(Path.home()))
 OC_PORT = int(os.getenv("OPENCODE_SERVER_PORT", "4100"))
 OC_URL = os.getenv("OPENCODE_SERVER_URL", f"http://127.0.0.1:{OC_PORT}")
 
-VERSION = "1.6.0"
+VERSION = "1.9.1"
 
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
@@ -59,11 +63,7 @@ def _get_owner_chat() -> int | None:
 
 def is_owner(update: Update) -> bool:
     user = update.effective_user
-    if not user:
-        return False
-    if OWNER_ID and user.id != OWNER_ID:
-        return False
-    return True
+    return bool(user) and user.id == OWNER_ID
 
 
 async def reject_unauthorized(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -146,8 +146,8 @@ async def oc_stop_server():
         except Exception:
             try:
                 _server_proc.kill()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Falha ao matar o servidor opencode: %s", e)
     _server_proc = None
 
 
@@ -169,21 +169,28 @@ def _read_oc_port_from_env() -> tuple[int, str]:
     return port, url
 
 
-async def _kill_opencode_servers(timeout: float = 15.0) -> bool:
-    """Derruba quaisquer processos `opencode serve --port ...` (incluindo órfãos
-    da porta antiga). Retorna True se nenhum sobrou ao final."""
+async def _kill_opencode_servers(ports: set[int] | None = None, timeout: float = 15.0) -> bool:
+    """Derruba apenas os processos `opencode serve --port <porta>` do próprio
+    usuário (incluindo órfãos da porta antiga), sem matar por padrão global
+    outras instâncias do opencode na máquina. Retorna True se nenhum sobrou."""
+    ports = ports or {OC_PORT}
     targets: list[int] = []
+    uid = os.getuid()
     for _ in range(3):
-        proc = await asyncio.create_subprocess_exec(
-            "pgrep", "-f", "opencode serve --port",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        out, _ = await proc.communicate()
-        targets = [int(x) for x in out.decode().split() if int(x) != os.getpid()]
+        targets = []
+        for port in sorted(ports):
+            proc = await asyncio.create_subprocess_exec(
+                "pgrep", "-u", str(uid), "-f", f"opencode serve --port {port}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            out, _ = await proc.communicate()
+            for x in out.decode().split():
+                pid = int(x)
+                if pid != os.getpid() and pid not in targets:
+                    targets.append(pid)
         if targets:
             break
-        targets = []
         await asyncio.sleep(0.3)
     if not targets:
         return True
@@ -212,7 +219,7 @@ async def _kill_opencode_servers(timeout: float = 15.0) -> bool:
         except (ProcessLookupError, PermissionError):
             pass
     await asyncio.sleep(0.5)
-    return not targets or await _kill_opencode_servers(0.5)
+    return not targets or await _kill_opencode_servers(ports, 0.5)
 
 
 def _spawn_bot_process():
@@ -236,41 +243,119 @@ def _spawn_bot_process():
         log_fh.close()
 
 
-async def _perform_restart(chat_id: int):
-    """Executa o restart de verdade: troca de porta, derruba o servidor antigo,
-    sobe um novo na porta configurada, relaça o bot e encerra este processo."""
+async def _cycle_server_locked() -> None:
+    """Derruba o `opencode serve` atual (inclusive zumbis) e sobe um novo,
+    recriando o cliente HTTP. O processo do bot continua o mesmo."""
     global OC_PORT, OC_URL, _client, _server_proc, _we_started_server
-
     new_port, new_url = _read_oc_port_from_env()
-    try:
-        OC_PORT, OC_URL = new_port, new_url
-        if _client is not None:
+    OC_PORT, OC_URL = new_port, new_url
+    if _client is not None:
+        try:
             await _client.aclose()
-            _client = None
-        _server_proc, _we_started_server = None, False
+        except Exception:
+            pass
+        _client = None
+    await _kill_opencode_servers({OC_PORT})
+    if _server_proc is not None:
+        try:
+            await asyncio.wait_for(_server_proc.wait(), timeout=5)
+        except Exception:
+            pass
+        _server_proc = None
+    _we_started_server = False
+    await oc_ensure_server()
+    logger.info("Servidor opencode reciclado (porta=%d)", OC_PORT)
 
-        await _kill_opencode_servers()
-        await oc_ensure_server()
 
-        # O servidor recém-iniciado fica vivo; o post_shutdown não deve matá-lo.
-        _server_proc, _we_started_server = None, False
+async def _respawn_bot_and_exit() -> None:
+    """Sobe um processo novo do bot via run.sh e encerra este via SIGTERM
+    (o run_polling faz o shutdown gracioso). Quem chama deve antes desarmar
+    o oc_stop_server (via _we_started_server=False) se o servidor deve ficar no ar."""
+    _spawn_bot_process()
+    await asyncio.sleep(1.0)
+    os.kill(os.getpid(), signal.SIGTERM)
 
-        _spawn_bot_process()
-        await asyncio.sleep(1.5)
-    except Exception as e:
-        logger.exception("Falha durante o restart")
-        app = _app_ref
+
+async def _restart_server_only(chat_id: int):
+    """Reinicia s\u00f3 o servidor opencode. O bot continua no ar."""
+    app = _app_ref
+    try:
+        await _kill_all_turns()
+        await _cycle_server_locked()
+        logger.info("Restart do servidor conclu\u00eddo (porta=%d)", OC_PORT)
         if app:
             try:
-                msg = f"\u274c *Falha no restart:* `{e}`\n\nVerifique o log: `.opencode_bot_server.log`"
+                await app.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"\u2705 *Servidor reiniciado* \u2014 servidor `{OC_URL}` OK. O bot continuou no ar.",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
+    except Exception as e:
+        logger.exception("Falha no restart do servidor")
+        if app:
+            try:
+                msg = f"\u274c *Falha no restart do servidor:* `{e}`\n\nVerifique o log: `.opencode_bot_server.log`"
                 await app.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
             except Exception:
                 pass
-        return
 
+
+async def _restart_bot_only(chat_id: int):
+    """Reinicia s\u00f3 o bot do Telegram (novo processo). O servidor continua no ar."""
+    global _we_started_server
     app = _app_ref
     if app:
-        await app.stop()
+        try:
+            await app.bot.send_message(
+                chat_id=chat_id,
+                text="\U0001f501 *Reiniciando o bot...* volto em segundos. O servidor continua no ar.",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+    await _kill_all_turns()
+    _we_started_server = False  # post_shutdown n\u00e3o pode matar o servidor ao sair
+    await _respawn_bot_and_exit()
+
+
+async def _restart_both(chat_id: int):
+    """Reinicia o servidor e o bot. O processo novo sobe um servidor fresco no boot."""
+    global _server_proc, _we_started_server
+    app = _app_ref
+    if app:
+        try:
+            await app.bot.send_message(
+                chat_id=chat_id,
+                text="\U0001f501 *Reiniciando bot + servidor...* volto em segundos.",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+    await _kill_all_turns()
+    try:
+        await _kill_opencode_servers({OC_PORT})
+    except Exception:
+        logger.exception("Falha ao derrubar o servidor no restart duplo")
+    if _server_proc is not None:
+        try:
+            await asyncio.wait_for(_server_proc.wait(), timeout=5)
+        except Exception:
+            pass
+        _server_proc = None
+    _we_started_server = False
+    await _respawn_bot_and_exit()
+
+
+async def _perform_restart(chat_id: int, target: str = "both"):
+    """Despacha o /restart: `bot`, `server` ou `both`."""
+    if target == "bot":
+        await _restart_bot_only(chat_id)
+    elif target == "server":
+        await _restart_server_only(chat_id)
+    else:
+        await _restart_both(chat_id)
 
 
 async def oc_create_session() -> str:
@@ -279,16 +364,43 @@ async def oc_create_session() -> str:
     return r.json()["id"]
 
 
-async def oc_send_message(sid: str, text: str, model: dict | None = None, agent: str | None = None):
-    body: dict = {"parts": [{"type": "text", "text": text}]}
+async def oc_send_message(sid: str, text: str = "", model: dict | None = None, agent: str | None = None, parts: list | None = None):
+    body_parts: list[dict] = []
+    if text:
+        body_parts.append({"type": "text", "text": text})
+    if parts:
+        body_parts.extend(parts)
+    body: dict = {"parts": body_parts}
     if model:
         body["model"] = model
     if agent:
         body["agent"] = agent
-    await _client.post(
+    r = await _client.post(
         f"/session/{sid}/prompt_async",
         json=body,
     )
+    r.raise_for_status()
+
+
+async def oc_send_with_retry(chat_cfg: dict, turn: dict, text: str, model: dict | None = None, agent: str | None = None, parts: list | None = None):
+    for attempt in (1, 2):
+        try:
+            await oc_send_message(turn["sid"], text, model=model, agent=agent, parts=parts)
+            return
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code != 404 or attempt == 2:
+                raise
+            logger.warning("Sessão %s sumiu do servidor (404); recriando sessão", (turn.get("sid") or "")[-6:])
+        except httpx.ConnectError:
+            if attempt == 2:
+                raise
+            logger.warning("Servidor opencode fora durante o envio; religando e tentando de novo")
+            await oc_ensure_server()
+        sid = await oc_create_session()
+        turn["sid"] = sid
+        chat_cfg["sid"] = sid
+        logger.info("Nova sessão criada: %s", sid[-6:])
+    raise RuntimeError("não foi possível enviar a mensagem para o opencode")
 
 
 async def _run_cli(*args: str, timeout: int = 30) -> str:
@@ -337,42 +449,289 @@ def _mcp_url(name: str) -> str:
     return (_load_mcp_cfg().get(name) or {}).get("url") or ""
 
 
-_JSONC_COMMENT_RE = re.compile(r"//.*?$|/\*.*?\*/", re.MULTILINE | re.DOTALL)
+def _skip_jsonc_string(text: str, i: int) -> int:
+    """text[i] é uma aspa dupla; retorna o índice logo após a aspa de fechamento."""
+    n = len(text)
+    i += 1
+    while i < n:
+        c = text[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == '"':
+            return i + 1
+        i += 1
+    return n
+
+
+def _skip_jsonc_ws(text: str, i: int, end: int) -> int:
+    """Avança sobre espaços e comentários JSONC até `end` (exclusive)."""
+    n = min(len(text), end)
+    while i < n:
+        c = text[i]
+        if c in " \t\r\n":
+            i += 1
+        elif c == "/" and i + 1 < n and text[i + 1] == "/":
+            j = text.find("\n", i)
+            i = j + 1 if j != -1 else n
+        elif c == "/" and i + 1 < n and text[i + 1] == "*":
+            j = text.find("*/", i + 2)
+            i = j + 2 if j != -1 else n
+        else:
+            break
+    return i
 
 
 def _strip_jsonc_comments(text: str) -> str:
-    return _JSONC_COMMENT_RE.sub("", text)
+    """Remove comentários (// e /* */) fora de strings, preservando a estrutura."""
+    n = len(text)
+    out: list[str] = []
+    i = 0
+    while i < n:
+        c = text[i]
+        if c == '"':
+            j = _skip_jsonc_string(text, i)
+            out.append(text[i:j])
+            i = j
+        elif c == "/" and i + 1 < n and text[i + 1] == "/":
+            j = text.find("\n", i)
+            i = j if j != -1 else n
+        elif c == "/" and i + 1 < n and text[i + 1] == "*":
+            j = text.find("*/", i + 2)
+            i = j + 2 if j != -1 else n
+            out.append(" ")
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
 
 
 def _has_jsonc_comments(text: str) -> bool:
-    return bool(_JSONC_COMMENT_RE.search(text))
+    n = len(text)
+    i = 0
+    while i < n:
+        c = text[i]
+        if c == '"':
+            i = _skip_jsonc_string(text, i)
+        elif c == "/" and i + 1 < n and text[i + 1] in ("/", "*"):
+            return True
+        else:
+            i += 1
+    return False
+
+
+def _jsonc_load(raw: str) -> dict:
+    if not raw.strip():
+        return {}
+    try:
+        data = json.loads(_strip_jsonc_comments(raw))
+    except Exception as e:
+        logger.debug("opencode.jsonc ilegível: %s", e)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _jsonc_root_span(raw: str) -> tuple[int | None, int | None]:
+    """Retorna (índice do '{' raiz, índice do '}' raiz) do objeto JSONC, ou (None, None)."""
+    depth = 0
+    i = 0
+    n = len(raw)
+    open_idx = None
+    while i < n:
+        c = raw[i]
+        if c == '"':
+            i = _skip_jsonc_string(raw, i)
+            continue
+        if c == "{":
+            if depth == 0:
+                open_idx = i
+            depth += 1
+            i += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return open_idx, i
+            i += 1
+        elif c == "/" and i + 1 < n and raw[i + 1] == "/":
+            j = raw.find("\n", i)
+            i = j + 1 if j != -1 else n
+        elif c == "/" and i + 1 < n and raw[i + 1] == "*":
+            j = raw.find("*/", i + 2)
+            i = j + 2 if j != -1 else n
+        else:
+            i += 1
+    return None, None
+
+
+def _jsonc_last_content(raw: str, start: int, end: int) -> int:
+    """Índice do último caractere que não é espaço/comentário em [start, end), ou -1."""
+    i = start
+    last = -1
+    n = min(len(raw), end)
+    while i < n:
+        c = raw[i]
+        if c == '"':
+            j = _skip_jsonc_string(raw, i)
+            last = j - 1
+            i = j
+        elif c == "/" and i + 1 < n and raw[i + 1] == "/":
+            j = raw.find("\n", i)
+            i = j + 1 if j != -1 else n
+        elif c == "/" and i + 1 < n and raw[i + 1] == "*":
+            j = raw.find("*/", i + 2)
+            i = j + 2 if j != -1 else n
+        elif c in " \t\r\n":
+            i += 1
+        else:
+            last = i
+            i += 1
+    return last
+
+
+def _jsonc_value_end(raw: str, start: int, bound: int) -> int:
+    """Índice logo após o valor JSON que começa em `start` (dentro de [start, bound))."""
+    n = min(len(raw), bound)
+    depth = 0
+    i = start
+    while i < n:
+        c = raw[i]
+        if c == '"':
+            j = _skip_jsonc_string(raw, i)
+            if depth == 0:
+                return j
+            i = j
+        elif c in " \t\r\n" or (c == "/" and i + 1 < n and raw[i + 1] in ("/", "*")):
+            i = _skip_jsonc_ws(raw, i, n)
+        elif c in "{[":
+            depth += 1
+            i += 1
+        elif c in "}]":
+            depth -= 1
+            i += 1
+            if depth == 0:
+                return i
+        elif c in ",:":
+            if depth == 0:
+                return i
+            i += 1
+        else:
+            i += 1
+            while i < n and raw[i] not in ",{}[]\" \t\r\n" and not (
+                raw[i] == "/" and i + 1 < n and raw[i + 1] in ("/", "*")
+            ):
+                i += 1
+            if depth == 0:
+                return i
+    return n
+
+
+def _jsonc_find_prop(raw: str, start: int, end: int, key: str) -> tuple[int, int, int] | None:
+    """Retorna (início da chave, início do valor, fim do valor) da propriedade
+    `key` no nível zero dentro de [start, end), ou None. Lida com aninhamento,
+    strings e comentários."""
+    i = start
+    depth = 0
+    n = min(len(raw), end)
+    while i < n:
+        c = raw[i]
+        if c in " \t\r\n" or (c == "/" and i + 1 < n and raw[i + 1] in ("/", "*")):
+            i = _skip_jsonc_ws(raw, i, n)
+            continue
+        if c == '"':
+            if depth == 0:
+                j = _skip_jsonc_string(raw, i)
+                name = raw[i + 1:j - 1]
+                k = _skip_jsonc_ws(raw, j, n)
+                if name == key and k < n and raw[k] == ":":
+                    vs = _skip_jsonc_ws(raw, k + 1, n)
+                    ve = _jsonc_value_end(raw, vs, n)
+                    return i, vs, ve
+                i = j
+            else:
+                i = _skip_jsonc_string(raw, i)
+            continue
+        if c in "{[":
+            depth += 1
+        elif c in "}]":
+            depth -= 1
+        i += 1
+    return None
+
+
+def _jsonc_parseable(text: str) -> bool:
+    try:
+        data = json.loads(_strip_jsonc_comments(text))
+        return isinstance(data, dict)
+    except Exception:
+        return False
+
+
+def _jsonc_upsert_mcp(raw: str, name: str, cfg_json: str) -> str | None:
+    """Edita opencode.jsonc cirurgicamente (preservando comentários) para
+    adicionar/atualizar mcp.<name>. Retorna o texto novo, ou None se não
+    conseguir editar com segurança."""
+    open_i, close_i = _jsonc_root_span(raw)
+    if open_i is None:
+        return None
+    mcp = _jsonc_find_prop(raw, open_i + 1, close_i, "mcp")
+    name_json = f'"{name}": {cfg_json}'
+    if mcp is None:
+        last = _jsonc_last_content(raw, open_i + 1, close_i)
+        ins = f'\n  "mcp": {{\n    {name_json}\n  }}' if last < 0 else (
+            f"{'' if raw[last] == ',' else ','}\n  \"mcp\": {{\n    {name_json}\n  }}"
+        )
+        return raw[:close_i] + ins + raw[close_i:]
+    _, vs, ve = mcp
+    if raw[vs] != "{":
+        return None
+    entry = _jsonc_find_prop(raw, vs + 1, ve - 1, name)
+    if entry:
+        _, evs, eve = entry
+        return raw[:evs] + cfg_json + raw[eve:]
+    last = _jsonc_last_content(raw, vs + 1, ve - 1)
+    if last < 0:
+        ins = f"\n    {name_json}\n  "
+    else:
+        ins = f"{'' if raw[last] == ',' else ','}\n    {name_json}\n  "
+    return raw[:ve - 1] + ins + raw[ve - 1:]
+
+
+def _jsonc_remove_mcp(raw: str, name: str) -> str | None:
+    """Remova cirurgicamente mcp.<name>, preservando comentários. None se falhar."""
+    open_i, close_i = _jsonc_root_span(raw)
+    if open_i is None:
+        return None
+    mcp = _jsonc_find_prop(raw, open_i + 1, close_i, "mcp")
+    if mcp is None:
+        return None
+    _, vs, ve = mcp
+    entry = _jsonc_find_prop(raw, vs + 1, ve - 1, name)
+    if entry is None:
+        return None
+    ps, _, ee = entry
+    prev = _jsonc_last_content(raw, vs + 1, ps)
+    if prev >= 0 and raw[prev] == ",":
+        return raw[:prev] + raw[ee:]
+    k = _skip_jsonc_ws(raw, ee, ve - 1)
+    if k < ve - 1 and raw[k] == ",":
+        return raw[:ps] + raw[k + 1:]
+    return raw[:ps] + raw[ee:]
 
 
 async def _mcp_set_server(name: str, url: str, headers: dict | None = None) -> str:
     """Adds/updates an MCP server entry in opencode.jsonc.
 
-    NOTE: opencode.jsonc allows comments (it's JSONC), but Python's json module
-    doesn't round-trip them. Rewriting the file with json.dumps would silently
-    delete any comments a human put there. To avoid destroying data we refuse
-    to touch the file if comments are present, and we always keep a .bak copy
-    of whatever we do overwrite.
+    opencode.jsonc is JSONC (comments allowed), and Python's json module does
+    not round-trip comments — so when the file has comments we edit it
+    surgically, in place, preserving everything else. Files without comments
+    are rewritten with json.dumps. Either way we keep a .bak of whatever we
+    overwrite and we restrict file permissions to the owner (tokens are plain
+    text in there).
     """
     p = _mcp_file()
-    raw = ""
-    data = {}
-    if p.exists():
-        raw = p.read_text()
-        if _has_jsonc_comments(raw):
-            return (
-                "\u26a0\ufe0f `opencode.jsonc` tem coment\u00e1rios e n\u00e3o posso reescrev\u00ea-lo sem "
-                "apag\u00e1-los (o parser JSON do Python n\u00e3o preserva coment\u00e1rios). "
-                "Edite o arquivo manualmente ou remova os coment\u00e1rios e tente de novo."
-            )
-        try:
-            data = json.loads(raw) if raw.strip() else {}
-        except Exception:
-            data = {}
-    mcp = data.setdefault("mcp", {})
+    raw = p.read_text() if p.exists() else ""
+    data = _jsonc_load(raw)
+    mcp = (data or {}).get("mcp") or {}
     cfg = dict(mcp.get(name) or {})
     cfg["type"] = "remote"
     if url:
@@ -384,19 +743,79 @@ async def _mcp_set_server(name: str, url: str, headers: dict | None = None) -> s
         cfg["headers"] = merged
     if not cfg.get("url"):
         return "\u274c sem URL \u2014 passe `--url <url>`"
-    mcp[name] = cfg
+    cfg_json = json.dumps(cfg, indent=2, ensure_ascii=False)
     try:
-        if raw:
-            p.with_suffix(p.suffix + ".bak").write_text(raw)
+        if not raw.strip():
+            as_text = json.dumps({"mcp": {name: cfg}}, indent=2, ensure_ascii=False) + "\n"
+        elif _has_jsonc_comments(raw):
+            edited = _jsonc_upsert_mcp(raw, name, cfg_json)
+            if edited is None or not _jsonc_parseable(edited):
+                return (
+                    "\u26a0\ufe0f `opencode.jsonc` tem coment\u00e1rios e n\u00e3o consegui "
+                    "edit\u00e1-lo com seguran\u00e7a. Edite o arquivo manualmente."
+                )
+            as_text = edited
+        else:
+            data.setdefault("mcp", {})[name] = cfg
+            as_text = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    except Exception as e:
+        return f"\u274c falha ao preparar config: {e}"
+    try:
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+        if raw and raw != as_text:
+            bak = p.with_suffix(p.suffix + ".bak")
+            bak.write_text(raw)
+            os.chmod(bak, 0o600)
+        p.write_text(as_text)
+        os.chmod(p, 0o600)
     except Exception as e:
         return f"\u274c falha ao gravar config: {e}"
     try:
-        await _client.post("/mcp", json={"name": name, "config": cfg})
+        r = await _client.post("/mcp", json={"name": name, "config": cfg})
+        r.raise_for_status()
         return f"\u2705 `{name}` configurado (arquivo + servidor em execu\u00e7\u00e3o)."
     except Exception as e:
         return f"\u26a0\ufe0f Config salva no arquivo, mas o servidor n\u00e3o aplicou: {e}"
+
+
+async def _mcp_remove_server(name: str, raw: str) -> str:
+    """Removes an MCP server entry from opencode.jsonc (preserving comments)
+    and asks the opencode server to drop it too."""
+    if not raw.strip():
+        return f"\u274c `{name}` n\u00e3o est\u00e1 configurado no arquivo."
+    data = _jsonc_load(raw)
+    if name not in ((data or {}).get("mcp") or {}):
+        return f"\u274c `{name}` n\u00e3o est\u00e1 configurado."
+    try:
+        if _has_jsonc_comments(raw):
+            edited = _jsonc_remove_mcp(raw, name)
+            if edited is None or not _jsonc_parseable(edited):
+                return (
+                    "\u26a0\ufe0f `opencode.jsonc` tem coment\u00e1rios e n\u00e3o consegui "
+                    "edit\u00e1-lo com seguran\u00e7a. Edite o arquivo manualmente."
+                )
+            as_text = edited
+        else:
+            mcp = data["mcp"]
+            mcp.pop(name, None)
+            if not mcp:
+                data.pop("mcp", None)
+            as_text = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+        p = _mcp_file()
+        if raw != as_text:
+            bak = p.with_suffix(p.suffix + ".bak")
+            bak.write_text(raw)
+            os.chmod(bak, 0o600)
+        p.write_text(as_text)
+        os.chmod(p, 0o600)
+    except Exception as e:
+        return f"\u274c falha ao remover do arquivo: {e}"
+    try:
+        r = await _client.request("DELETE", f"/mcp/{name}")
+        r.raise_for_status()
+        return f"\u2705 `{name}` removido."
+    except Exception as e:
+        return f"\u26a0\ufe0f Removido do arquivo, mas o servidor n\u00e3o confirmou: {e}"
 
 
 async def oc_answer_permission(sid: str, perm_id: str, response: str):
@@ -430,8 +849,8 @@ async def oc_reject_question(request_id: str) -> bool:
 async def oc_abort(sid: str):
     try:
         await _client.post(f"/session/{sid}/abort")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Falha ao abortar sessão %s: %s", (sid or "")[-6:], e)
 
 
 async def _kill_all_turns(chat_id: int | None = None):
@@ -440,8 +859,8 @@ async def _kill_all_turns(chat_id: int | None = None):
         if turn and turn.get("sid"):
             try:
                 await oc_abort(turn["sid"])
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Falha ao abortar turno %s: %s", cid, e)
 
 
 def _find_turn(sid: str) -> dict | None:
@@ -490,22 +909,106 @@ def _code(s: str) -> str:
     return "`" + escaped + "`"
 
 
+# ---- inline buttons ---------------------------------------------------
+
+def _btn_help() -> InlineKeyboardButton:
+    return InlineKeyboardButton("Ajuda", callback_data="/help")
+
+
+def _btn_new() -> InlineKeyboardButton:
+    return InlineKeyboardButton("Nova conversa", callback_data="/new")
+
+
+def _btn_status() -> InlineKeyboardButton:
+    return InlineKeyboardButton("Status", callback_data="/status")
+
+
+def _btn_cancel() -> InlineKeyboardButton:
+    return InlineKeyboardButton("Cancelar", callback_data="/cancel")
+
+
+def _kb_quick() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[_btn_help(), _btn_new(), _btn_status()]])
+
+
+def _kb_after_turn() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[_btn_new(), _btn_help(), _btn_status()]])
+
+
+def _kb_status(busy_turns: int) -> InlineKeyboardMarkup:
+    row1 = [_btn_new(), _btn_help()]
+    row2 = [InlineKeyboardButton("Mudar modelo", callback_data="/models")]
+    if busy_turns:
+        row2.append(_btn_cancel())
+    return InlineKeyboardMarkup([row1, row2])
+
+
+def _kb_restart() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("\U0001f916 S\u00f3 o bot", callback_data="__restart:bot"),
+         InlineKeyboardButton("\U0001f5a5\ufe0f S\u00f3 o servidor", callback_data="__restart:server")],
+        [InlineKeyboardButton("\U0001f501 Bot + servidor", callback_data="__restart:both")],
+        [InlineKeyboardButton("\u274c Cancelar", callback_data="/status")],
+    ])
+
+
+_RESTART_ALIASES = {
+    "bot": "bot",
+    "server": "server", "servidor": "server", "srv": "server",
+    "both": "both", "ambos": "both", "tudo": "both", "all": "both",
+}
+
+_RESTART_LABELS = {"bot": "o bot", "server": "o servidor", "both": "o bot + o servidor"}
+
+
+def _models_kb(models: list[str]) -> list[list[InlineKeyboardButton]]:
+    """Converte a lista de modelos do CLI em botões (até 2 por linha).
+    O callback leva o spec `providerID/modelID`; fica bem abaixo do limite
+    de 64 bytes do Telegram."""
+    rows: list[list[InlineKeyboardButton]] = []
+    pending: list[InlineKeyboardButton] = []
+    for spec in models:
+        pending.append(InlineKeyboardButton(spec, callback_data=f"mod:{spec}"))
+        if len(pending) == 2:
+            rows.append(pending)
+            pending = []
+    if pending:
+        rows.append(pending)
+    return rows
+
+
 # ---- secret redaction -------------------------------------------------
 # Anything the agent runs (grep/curl/etc) gets echoed into Telegram, which
 # means a raw API key or token found on disk ends up permanently in the
 # chat's message history. This is a best-effort mask, not a guarantee --
-# it catches the common shapes (key=..., Bearer ..., long hex blobs, known
-# provider prefixes) but a determined secret in an unusual format can still
-# slip through. Treat the Telegram history as sensitive regardless.
+# it catches the common shapes (key=..., Bearer ..., known provider prefixes)
+# but a determined secret in an unusual format can still slip through. Treat
+# the Telegram history as sensitive regardless.
+#
+# Bare hex blobs used to be masked blindly, which false-positived on any
+# SHA/MD5 hash, git commit, or hyphenless UUID. Now we only mask a bare hex
+# blob when a secret-ish keyword appears nearby (e.g. `key=`, `token`, ...),
+# so unrelated hashes stay readable.
 _SECRET_PATTERNS = [
     re.compile(r"(?i)\b((?:api[_-]?key|apikey|access[_-]?token|auth[_-]?token|secret|password|passwd|token)\s*[:=]\s*['\"]?)([A-Za-z0-9\-_\.]{6,})"),
     re.compile(r"(?i)(bearer\s+)([A-Za-z0-9\-_\.]{10,})"),
-    re.compile(r"\b[0-9A-Fa-f]{32,64}\b"),          # steam keys, md5/sha hashes, generic hex secrets
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),             # AWS access key id
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),   # GitHub tokens
-    re.compile(r"\bsk-[A-Za-z0-9]{16,}\b"),          # OpenAI/Anthropic-style keys
+    re.compile(r"\bsk-[A-Za-z0-9\-]{20,}\b"),       # OpenAI/Anthropic-style keys
     re.compile(r"\bxox[baprs]-[A-Za-z0-9\-]{10,}\b"),  # Slack tokens
 ]
+_MASKED = "\u2588\u2588\u2588MASKED\u2588\u2588\u2588"
+_SECRET_HEX = re.compile(r"\b[0-9A-Fa-f]{32,64}\b")
+_SECRET_KW = re.compile(r"(?:api[_-]?key|apikey|access[_-]?token|auth[_-]?token|client[_-]?secret|secret|passwd|password|steam|token)", re.I)
+
+
+def _mask_hex_with_context(s: str) -> str:
+    """Mascara hex 32–64 só quando perto de uma palavra-chave de segredo,
+    deixando hashes/commits/UUIDs comuns legíveis."""
+    def _sub(m):
+        window = s[max(0, m.start() - 60):m.start()]
+        return _MASKED if _SECRET_KW.search(window) else m.group(0)
+    return _SECRET_HEX.sub(_sub, s)
 
 
 def _redact_secrets(s: str) -> str:
@@ -514,10 +1017,10 @@ def _redact_secrets(s: str) -> str:
     out = s
     for pat in _SECRET_PATTERNS:
         if pat.groups:
-            out = pat.sub(lambda m: m.group(1) + "\u2588\u2588\u2588MASKED\u2588\u2588\u2588", out)
+            out = pat.sub(lambda m: m.group(1) + _MASKED, out)
         else:
-            out = pat.sub("\u2588\u2588\u2588MASKED\u2588\u2588\u2588", out)
-    return out
+            out = pat.sub(_MASKED, out)
+    return _mask_hex_with_context(out)
 
 
 def _tail_out(s: str, n: int = 450) -> str:
@@ -614,6 +1117,8 @@ def _render_running(turn: dict) -> tuple[str, InlineKeyboardMarkup | None]:
         else:
             lines += ["", "\u23f3 *pensando\u2026*"]
     rows = _q_kb(turn)
+    if not rows and not has_prompt:
+        rows = [[_btn_cancel()]]
     kb = InlineKeyboardMarkup(rows) if rows else None
     return "\n".join(lines), kb
 
@@ -867,8 +1372,8 @@ def _start_typing(turn: dict):
         while turn["busy"]:
             try:
                 await _app_ref.bot.send_chat_action(chat_id=turn["chat_id"], action="typing")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Falha ao enviar indicador de digitação: %s", e)
             await asyncio.sleep(4)
 
     turn["typing_task"] = asyncio.create_task(loop())
@@ -1041,7 +1546,7 @@ def _new_turn_skeleton(chat_id: int) -> dict:
     }
 
 
-async def _start_turn(update_or_chat, text: str):
+async def _start_turn(update_or_chat, text: str, parts: list | None = None):
     """Runs one opencode turn for a chat. update can be a message update."""
     chat_id = update_or_chat.effective_chat.id if hasattr(update_or_chat, "effective_chat") else update_or_chat
 
@@ -1070,7 +1575,7 @@ async def _start_turn(update_or_chat, text: str):
         _start_typing(turn)
         turn["stream_task"] = asyncio.create_task(_stream_loop(turn))
 
-        await oc_send_message(sid, text, model=chat_cfg.get("model"), agent=chat_cfg.get("agent"))
+        await oc_send_with_retry(chat_cfg, turn, text, model=chat_cfg.get("model"), agent=chat_cfg.get("agent"), parts=parts)
     except Exception as e:
         logger.exception("Falha ao iniciar turn")
         turn["out_text"] = f"\u274c Falha ao enviar para o opencode: {e}"
@@ -1100,51 +1605,96 @@ async def _finish_turn(chat_id: int):
     _stop_stream(turn)
 
     app = _app_ref
-    # ---- bal\u00e3o do resultado (sem blockquote) ----
+    # ---- inverted order: answer on top, think below ----
     answer = (turn["out_text"] or "").strip()
     if not answer:
         answer = "(sem resposta)"
     bodies = [_telegram_html(c, max_len=3500) for c in _split_text(answer, limit=3500)]
     first_body = bodies[0]
-    if turn["result_msg_id"] is None:
-        msg = await app.bot.send_message(chat_id=chat_id, text=first_body, parse_mode="HTML")
-        turn["result_msg_id"] = msg.message_id
-    else:
+
+    # the answer takes over the top balloon (the "pensando…" placeholder)
+    answer_msg_id = turn["status_msg_id"]
+    if answer_msg_id is not None:
         try:
             await app.bot.edit_message_text(
-                chat_id=chat_id, message_id=turn["result_msg_id"], text=first_body, parse_mode="HTML"
+                chat_id=chat_id, message_id=answer_msg_id, text=first_body, parse_mode="HTML"
             )
         except TelegramError:
             try:
                 await app.bot.edit_message_text(
-                    chat_id=chat_id, message_id=turn["result_msg_id"],
+                    chat_id=chat_id, message_id=answer_msg_id,
                     text=_plain_text(first_body),
                 )
             except TelegramError:
                 pass
-    for body in bodies[1:]:
+    else:
+        # unlikely fallback (placeholder never sent): answer as a new message
         try:
-            await app.bot.send_message(chat_id=chat_id, text=body, parse_mode="HTML")
+            msg = await app.bot.send_message(chat_id=chat_id, text=first_body, parse_mode="HTML")
         except TelegramError:
             try:
-                await app.bot.send_message(chat_id=chat_id, text=_plain_text(body))
+                msg = await app.bot.send_message(chat_id=chat_id, text=_plain_text(first_body))
             except TelegramError:
-                pass
+                msg = None
+        answer_msg_id = msg.message_id if msg is not None else None
 
-    # ---- bal\u00e3o do pensamento (expandable blockquote) ----
-    if turn["status_msg_id"] is not None:
-        text = _render_think(turn, turn["elapsed"])
+    last_msg_id = answer_msg_id
+    for body in bodies[1:]:
+        try:
+            msg = await app.bot.send_message(chat_id=chat_id, text=body, parse_mode="HTML")
+        except TelegramError:
+            try:
+                msg = await app.bot.send_message(chat_id=chat_id, text=_plain_text(body))
+            except TelegramError:
+                continue
+        last_msg_id = msg.message_id
+
+    # ---- think balloon (expandable blockquote) at the bottom ----
+    # reuses the streaming balloon (already below) or sends a new one
+    think_text = _render_think(turn, turn["elapsed"])
+    think_msg_id = turn["result_msg_id"]
+    if think_msg_id is not None and think_msg_id != answer_msg_id and len(bodies) > 1:
+        # with extra chunks, drop the partial streaming balloon to keep the
+        # order answer -> extras -> think
+        try:
+            await app.bot.delete_message(chat_id=chat_id, message_id=think_msg_id)
+            think_msg_id = None
+        except TelegramError:
+            pass
+    think_placed = False
+    if think_msg_id is not None and think_msg_id != answer_msg_id:
         try:
             await app.bot.edit_message_text(
-                chat_id=chat_id, message_id=turn["status_msg_id"], text=text, parse_mode="HTML"
+                chat_id=chat_id, message_id=think_msg_id, text=think_text, parse_mode="HTML"
             )
+            think_placed = True
         except TelegramError:
             try:
                 await app.bot.edit_message_text(
-                    chat_id=chat_id, message_id=turn["status_msg_id"], text=_plain_text(text)
+                    chat_id=chat_id, message_id=think_msg_id, text=_plain_text(think_text)
                 )
+                think_placed = True
             except TelegramError:
                 pass
+    if not think_placed:
+        try:
+            await app.bot.send_message(chat_id=chat_id, text=think_text, parse_mode="HTML")
+        except TelegramError:
+            try:
+                await app.bot.send_message(chat_id=chat_id, text=_plain_text(think_text))
+            except TelegramError:
+                pass
+
+    # ---- bot\u00f5es de a\u00e7\u00e3o p\u00f3s-turno ----
+    if last_msg_id is not None:
+        try:
+            await app.bot.edit_message_reply_markup(
+                chat_id=chat_id,
+                message_id=last_msg_id,
+                reply_markup=_kb_after_turn(),
+            )
+        except TelegramError:
+            pass
 
 
 def _split_text(text: str, limit: int = 4000) -> list[str]:
@@ -1311,6 +1861,97 @@ async def _refresh_after_question(turn: dict):
         await _push_status(turn, force=True)
 
 
+# ---------------------------------------------------------------- media
+
+_MEDIA_TYPES = ("document", "audio", "voice", "video", "animation")
+_MEDIA_FALLBACK_MIME = {
+    "document": "application/octet-stream",
+    "audio": "audio/mpeg",
+    "voice": "audio/ogg",
+    "video": "video/mp4",
+    "animation": "video/mp4",
+}
+_MEDIA_MAX_BYTES = 20 * 1024 * 1024
+
+
+def _safe_filename(name: str, default: str) -> str:
+    name = (name or "").strip()
+    name = re.sub(r"[^\w.\-()+\[\] ]", "_", name)[:120].strip()
+    return name or default
+
+
+def _media_entries(update: Update) -> list[tuple[str, str, str]]:
+    """Returns (file_id, filename, mime) for every attachment on the message."""
+    msg = update.message or update.edited_message
+    if not msg:
+        return []
+    out: list[tuple[str, str, str]] = []
+    if msg.photo:
+        photo = max(msg.photo, key=lambda p: p.file_size or 0)
+        out.append((photo.file_id, "photo.jpg", "image/jpeg"))
+    for name in _MEDIA_TYPES:
+        f = getattr(msg, name, None)
+        if not f:
+            continue
+        mime = getattr(f, "mime_type", None) or _MEDIA_FALLBACK_MIME[name]
+        fname = _safe_filename(getattr(f, "file_name", "") or "", f"{name}.bin")
+        out.append((f.file_id, fname, mime))
+    return out
+
+
+async def _media_to_file_parts(bot, entries: list[tuple[str, str, str]]) -> list[dict]:
+    """Downloads each attachment and turns it into an opencode `file` part."""
+    parts: list[dict] = []
+    for file_id, filename, mime in entries:
+        try:
+            f = await bot.get_file(file_id)
+        except Exception as e:
+            logger.warning("Falha ao obter mídia %s: %s", file_id, e)
+            parts.append({"type": "text", "text": f"[anexo não acessível: {filename}]"})
+            continue
+        if (f.file_size or 0) > _MEDIA_MAX_BYTES:
+            parts.append({"type": "text", "text": f"[anexo ignorado ({(f.file_size or 0) // (1024 * 1024)} MiB, limite 20 MiB): {filename}]"})
+            continue
+        try:
+            raw = await f.download_as_bytearray()
+        except Exception as e:
+            logger.warning("Falha ao baixar mídia %s: %s", file_id, e)
+            parts.append({"type": "text", "text": f"[falha ao baixar anexo: {filename}]"})
+            continue
+        b64 = base64.b64encode(bytes(raw)).decode("ascii")
+        parts.append({
+            "type": "file",
+            "url": f"data:{mime};base64,{b64}",
+            "filename": filename,
+            "mime": mime,
+        })
+    return parts
+
+
+async def _consume_custom_answer(update: Update, text: str) -> bool:
+    """Routes a plain-text message to a pending opencode question (custom
+    answer). Returns True when the message was consumed by that flow."""
+    if not text:
+        return False
+    chat_id = update.effective_chat.id
+    turn = TURNS.get(chat_id)
+    if not turn or not turn.get("awaiting_custom"):
+        return False
+    rid, qi = turn.pop("awaiting_custom")
+    item = next((q for q in turn["questions"] if q["request_id"] == rid and q["qidx"] == qi), None)
+    if not item:
+        return False
+    item["answer"] = [text]
+    ok = await _submit_question(turn, rid)
+    await update.message.reply_text(
+        "\u2705 *Resposta enviada ao opencode.*" if ok else
+        "\u274c *Falha ao enviar resposta ao opencode.*",
+        parse_mode="Markdown",
+    )
+    await _refresh_after_question(turn)
+    return True
+
+
 # ---------------------------------------------------------------- handlers
 
 async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1320,22 +1961,27 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if not text:
         return
-    chat_id = update.effective_chat.id
-    turn = TURNS.get(chat_id)
-    if turn and turn.get("awaiting_custom"):
-        rid, qi = turn.pop("awaiting_custom")
-        item = next((q for q in turn["questions"] if q["request_id"] == rid and q["qidx"] == qi), None)
-        if item:
-            item["answer"] = [text]
-            ok = await _submit_question(turn, rid)
-            await update.message.reply_text(
-                "\u2705 *Resposta enviada ao opencode.*" if ok else
-                "\u274c *Falha ao enviar resposta ao opencode.*",
-                parse_mode="Markdown",
-            )
-            await _refresh_after_question(turn)
-            return
+    if await _consume_custom_answer(update, text):
+        return
     await _start_turn(update, text)
+
+
+async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await reject_unauthorized(update, context)
+        return
+    text = (update.message.caption or "").strip()
+    if await _consume_custom_answer(update, text):
+        return
+    entries = _media_entries(update)
+    if not entries and not text:
+        await update.message.reply_text(
+            "\u26a0\ufe0f Anexos suportados: foto, documento, \u00e1udio, voz, v\u00eddeo e GIF.\n"
+            "Envie junto um texto ou legenda com a instru\u00e7\u00e3o.",
+        )
+        return
+    parts = await _media_to_file_parts(context.bot, entries) if entries else None
+    await _start_turn(update, text, parts=parts)
 
 
 def _find_qitem(turn: dict, rid: str, qi: int | None = None) -> dict | None:
@@ -1347,7 +1993,7 @@ def _find_qitem(turn: dict, rid: str, qi: int | None = None) -> dict | None:
 
 async def cb_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if OWNER_ID and query.from_user.id != OWNER_ID:
+    if query.from_user.id != OWNER_ID:
         await query.answer("Access denied.", show_alert=True)
         return
     chat_id = update.effective_chat.id
@@ -1419,7 +2065,7 @@ async def cb_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cb_permission(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if OWNER_ID and query.from_user.id != OWNER_ID:
+    if query.from_user.id != OWNER_ID:
         await query.answer("Access denied.", show_alert=True)
         return
     _, perm_id, response = query.data.split(":", 2)
@@ -1444,6 +2090,108 @@ async def cb_permission(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _push_status(turn, force=True)
 
 
+async def _btn_invoked(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cria um 'update' com .message apontando para a mensagem do bot\u00e3o."""
+    query = update.callback_query
+    message = query.message
+
+    class _Proxy:
+        # Handlers usam update.message (reply_text/delete) e update.effective_*.
+        # Em CallbackQuery updates o campo .message \u00e9 None, ent\u00e3o injetamos a
+        # mensagem onde o bot\u00e3o foi clicado e repassamos todo o resto ao update real.
+        def __init__(self):
+            self.message = message
+
+        def __getattr__(self, name):
+            return getattr(update, name)
+
+    return _Proxy()
+
+
+async def cb_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manipula bot\u00f5es de sele\u00e7\u00e3o de modelo (`mod:`)."""
+    query = update.callback_query
+    if query.from_user.id != OWNER_ID:
+        await query.answer("Access denied.", show_alert=True)
+        return
+    data = query.data or ""
+    if not data.startswith("mod:"):
+        await query.answer()
+        return
+    await query.answer()
+    spec = data[4:]
+    if "/" not in spec:
+        return
+    providerID, modelID = spec.rsplit("/", 1)
+    chat_cfg = context.bot_data.setdefault("chats", {}).setdefault(update.effective_chat.id, {})
+    chat_cfg["model"] = {"providerID": providerID, "modelID": modelID}
+    try:
+        await query.message.edit_text(
+            f"*Modelo atual:* `{spec}`\n\n\u2705 Modelo definido!",
+            parse_mode="Markdown",
+        )
+    except TelegramError:
+        await query.message.reply_text(f"\u2705 Modelo definido: `{spec}`", parse_mode="Markdown")
+
+
+async def cb_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Roteia os bot\u00f5es inline para os comandos correspondentes."""
+    query = update.callback_query
+    if query.from_user.id != OWNER_ID:
+        await query.answer("Access denied.", show_alert=True)
+        return
+    data = query.data or ""
+    await query.answer()
+
+    if data == "__restart_confirm" or data.startswith("__restart:"):
+        chat_id = update.effective_chat.id
+        # teclado antigo (s\u00f3 "Confirmar restart") equivale a tudo
+        target = data.split(":", 1)[1] if ":" in data else "both"
+        if target not in ("bot", "server", "both"):
+            return
+        await _kill_all_turns()
+        try:
+            await query.message.edit_text(
+                f"\U0001f501 *Reiniciando {_RESTART_LABELS[target]}...*",
+                parse_mode="Markdown",
+            )
+        except TelegramError:
+            await query.message.reply_text(
+                f"\U0001f501 *Reiniciando {_RESTART_LABELS[target]}...*",
+                parse_mode="Markdown",
+            )
+        await _perform_restart(chat_id, target)
+        return
+
+    cmd = data.split(" ", 1)[0]
+    if not cmd.startswith("/"):
+        return
+    handler = {
+        "/help": cmd_help,
+        "/new": cmd_new,
+        "/cancel": cmd_cancel,
+        "/status": cmd_status,
+        "/models": cmd_models,
+        "/agents": cmd_agents,
+        "/sessions": cmd_sessions,
+        "/mcp": cmd_mcp,
+        "/version": cmd_version,
+        "/stats": cmd_stats,
+    }.get(cmd)
+    if not handler:
+        return
+    injected = await _btn_invoked(update, context)
+    saved = context.args
+    if cmd == "/mcp":
+        context.args = [data.split(" ", 1)[1] if " " in data else "list"]
+    else:
+        context.args = []
+    try:
+        await handler(injected, context)
+    finally:
+        context.args = saved
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         await reject_unauthorized(update, context)
@@ -1451,8 +2199,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "\U0001f916 *opencode no Telegram*\n\n"
         "Envie qualquer mensagem e eu respondo com o opencode.\n\n"
-        "Digite /help para ver todos os comandos.",
+        "Toque nos bot\u00f5es abaixo para navegar:",
         parse_mode="Markdown",
+        reply_markup=_kb_quick(),
     )
 
 
@@ -1462,6 +2211,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "*Comandos do opencode:*\n\n"
+        "Envie fotos, \u00e1udios, v\u00eddeos e arquivos junto com um texto (\u00e0s vezes a legenda).\n\n"
         "  /models \u2014 lista modelos; `/models opencode/xx` define\n"
         "  /agents \u2014 lista agentes; `/agents <nome>` define\n"
         "  /sessions \u2014 lista sess\u00f5es; `/sessions <id>` retoma\n"
@@ -1469,12 +2219,13 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  /cancel \u2014 interrompe (alias /cancelar)\n"
         "  /summarize \u2014 dispara o resumo da sess\u00e3o\n"
         "  /stats \u2014 uso e custo do opencode\n"
-        "  /mcp \u2014 gerencia servidores MCP (list/add/auth/logout/debug)\n"
+        "  /mcp \u2014 gerencia servidores MCP (list/add/token/remove/auth/logout)\n"
         "  /version \u2014 vers\u00e3o instalada\n"
         "  /status \u2014 estado do servidor\n"
-        "  /restart \u2014 reinicia servidor e bot (nenhuma resposta em andamento \u00e9 perdida)\n"
+        "  /restart [bot|servidor|ambos] \u2014 reinicia o bot, o servidor ou os dois (respostas em andamento s\u00e3o interrompidas)\n"
         "  /help \u2014 esta ajuda (alias /ajuda)",
         parse_mode="Markdown",
+        reply_markup=_kb_quick(),
     )
 
 
@@ -1494,12 +2245,15 @@ async def cmd_models(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"\u2705 Modelo definido: `{providerID}/{modelID}`", parse_mode="Markdown")
         return
     out = await _run_cli("models", timeout=30)
-    lines = [l for l in out.splitlines() if l.strip()]
+    lines = [l.strip() for l in out.splitlines() if l.strip()]
+    models = [l for l in lines if "/" in l]
     cur = chat_cfg.get("model")
-    head = f"*Modelo atual:* `{(cur['providerID'] + '/' + cur['modelID']) if cur else '\u00e0 definir'}`\n\nModelos dispon\u00edveis:\n"
-    if len(lines) > 40:
-        lines = lines[:40] + ["\u2026 (+%d)" % (len(lines) - 40)]
-    await update.message.reply_text(head + "\n".join(f"`{l}`" for l in lines), parse_mode="Markdown")
+    head = f"*Modelo atual:* `{(cur['providerID'] + '/' + cur['modelID']) if cur else '\u00e0 definir'}`\n\nEscolha o modelo:"
+    if not models:
+        await update.message.reply_text("Nenhum modelo listado pelo CLI.", parse_mode="Markdown")
+        return
+    kb = InlineKeyboardMarkup(_models_kb(models))
+    await update.message.reply_text(head, parse_mode="Markdown", reply_markup=kb)
 
 
 async def cmd_agents(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1641,7 +2395,8 @@ async def cmd_mcp(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 "Uso: `/mcp token <nome> <TOKEN>`\n\n"
                 "Grava o header `Authorization: Bearer <TOKEN>` no servidor MCP. Para o Todoist, pegue seu API token em Todoist \u2192 Settings \u2192 Integrations \u2192 Developer.\n\n"
-                "\u26a0\ufe0f O token fica vis\u00edvel no hist\u00f3rico deste chat do Telegram \u2014 apague a mensagem depois de enviar, se puder.",
+                "\u26a0\ufe0f O token passa pelo Telegram (fica no backend deles mesmo depois que voc\u00ea apaga a mensagem). "
+                "Alternativa mais segura: edite `~/.config/opencode/opencode.jsonc` direto no servidor e `chmod 600` no arquivo.",
                 parse_mode="Markdown",
             )
             return
@@ -1700,6 +2455,16 @@ async def cmd_mcp(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"\u274c Falha: {e}")
         return
 
+    if sub in ("remove", "rm", "del"):
+        if len(args) < 2:
+            await update.message.reply_text("Uso: `/mcp remove <nome>`", parse_mode="Markdown")
+            return
+        p = _mcp_file()
+        raw = p.read_text() if p.exists() else ""
+        msg = await _mcp_remove_server(args[1], raw)
+        await update.message.reply_text(msg, parse_mode="Markdown")
+        return
+
     if sub in ("connect", "disconnect"):
         if len(args) < 2:
             await update.message.reply_text(f"Uso: `/mcp {sub} <nome>`", parse_mode="Markdown")
@@ -1716,6 +2481,7 @@ async def cmd_mcp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  `/mcp` \u2014 lista servidores\n"
         "  `/mcp add <nome> --url <url>` \u2014 adiciona remoto\n"
         "  `/mcp token <nome> <TOKEN>` \u2014 define token Bearer\n"
+        "  `/mcp remove <nome>` \u2014 remove servidor\n"
         "  `/mcp auth <nome>` \u2014 inicia OAuth\n"
         "  `/mcp callback <nome> <c\u00f3digo>` \u2014 conclui OAuth\n"
         "  `/mcp logout <nome>` \u2014 remove credenciais\n"
@@ -1734,6 +2500,20 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"\U0001f504 *Nova conversa iniciada* (sess\u00e3o `{sid[-6:]}`).", parse_mode="Markdown")
 
 
+async def _reply_or_edit(update, text: str, parse_mode=None, reply_markup=None):
+    """Bot\u00e3o transforma o pr\u00f3prio bal\u00e3o (edit); comando digitado manda msg nova."""
+    query = update.callback_query
+    if query is None or query.message is None:
+        await update.message.reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+        return
+    try:
+        await query.message.edit_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+    except TelegramError as e:
+        if "not modified" in str(e).lower():
+            return
+        await update.message.reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+
+
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         await reject_unauthorized(update, context)
@@ -1741,11 +2521,39 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     turn = TURNS.get(chat_id)
     if not turn:
-        await update.message.reply_text("Nada em andamento.")
+        await _reply_or_edit(update, "Nada em andamento.")
         return
     await oc_abort(turn["sid"])
     turn["out_text"] = "\u26d4 *Interrompido pelo dono.*"
     await _finish_turn(chat_id)
+
+
+async def _ensure_server_bg(chat_id: int):
+    """Sobe o servidor opencode em background e avisa o chat do resultado."""
+    app = _app_ref
+    try:
+        await oc_ensure_server()
+    except Exception as e:
+        logger.exception("Falha ao inicializar o servidor via /status")
+        if app:
+            try:
+                await app.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"\u274c *Servidor falhou ao inicializar:* `{e}`",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
+        return
+    if app:
+        try:
+            await app.bot.send_message(
+                chat_id=chat_id,
+                text="\u2705 *Servidor opencode funcionando.*",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1753,6 +2561,14 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reject_unauthorized(update, context)
         return
     ok = await oc_server_ok()
+    if not ok:
+        asyncio.create_task(_ensure_server_bg(update.effective_chat.id))
+        await _reply_or_edit(
+            update,
+            "\U0001f501 *Servidor est\u00e1 sendo inicializado...*",
+            parse_mode="Markdown",
+        )
+        return
     busy = sum(1 for t in TURNS.values() if t["busy"])
     chat_id = update.effective_chat.id
     chat_cfg = context.bot_data.setdefault("chats", {}).setdefault(chat_id, {})
@@ -1760,7 +2576,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     agent = chat_cfg.get("agent")
     sid = chat_cfg.get("sid")
     lines = [
-        f"*Servidor opencode:* {'\u2705 online' if ok else '\u274c offline'}",
+        f"*Servidor opencode:* \u2705 funcionando",
         f"*Sess\u00f5es em uso:* {len(TURNS)}",
         f"*Em processamento:* {busy}",
         f"*Diret\u00f3rio:* `{OPENCODE_DIR}`",
@@ -1772,21 +2588,30 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if agent:
         lines.append(f"*Agente:* `{agent}`")
     lines.append("_Use /sessions para ver as sess\u00f5es do servidor._")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    kb = _kb_status(busy)
+    await _reply_or_edit(update, "\n".join(lines), parse_mode="Markdown", reply_markup=kb)
 
 
 async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         await reject_unauthorized(update, context)
         return
-    chat_id = update.effective_chat.id
-    await _kill_all_turns(chat_id)
+    if context.args:
+        target = _RESTART_ALIASES.get(context.args[0].lower())
+        if target is None:
+            await update.message.reply_text(
+                "Uso: `/restart` ou `/restart bot|servidor|ambos`",
+                parse_mode="Markdown",
+            )
+            return
+        await _perform_restart(update.effective_chat.id, target)
+        return
     await update.message.reply_text(
-        "\U0001f501 *Reiniciando o servidor e o bot*\n\n"
-        "Derrubando o servidor antigo...",
+        "\u26a0\ufe0f *Reiniciar o qu\u00ea?*\n\n"
+        "Respostas em andamento ser\u00e3o interrompidas.",
         parse_mode="Markdown",
+        reply_markup=_kb_restart(),
     )
-    await _perform_restart(chat_id)
 
 
 # ---------------------------------------------------------------- bootstrap
@@ -1809,7 +2634,7 @@ async def post_init(app: Application):
         BotCommand("mcp", "Servidores MCP"),
         BotCommand("version", "Vers\u00e3o do opencode"),
         BotCommand("status", "Estado do servidor"),
-        BotCommand("restart", "Reiniciar servidor e bot"),
+        BotCommand("restart", "Reiniciar bot / servidor"),
     ])
     chat_id = _get_owner_chat()
     if chat_id:
@@ -1872,7 +2697,10 @@ def main():
     app.add_handler(CommandHandler("restart", cmd_restart))
     app.add_handler(CallbackQueryHandler(cb_permission, pattern=r"^perm:"))
     app.add_handler(CallbackQueryHandler(cb_question, pattern=r"^q[ostcr]:"))
+    app.add_handler(CallbackQueryHandler(cb_reply, pattern=r"^mod:"))
+    app.add_handler(CallbackQueryHandler(cb_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_chat))
+    app.add_handler(MessageHandler(filters.ATTACHMENT, handle_media))
     logger.info("=" * 44)
     logger.info("  Telegram opencode bot  v%s", VERSION)
     logger.info("  url=%s  dir=%s", OC_URL, OPENCODE_DIR)
