@@ -18,4 +18,4 @@ if [ ! -f ".env" ]; then
 fi
 
 echo "Starting opencode bot..."
-python3 bot.py
+python3 -m bot

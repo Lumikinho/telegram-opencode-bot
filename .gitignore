@@ -4,6 +4,9 @@
 # Logs
 *.log
 
+# Backups locais
+*.bak
+
 # Python
 __pycache__/
 *.pyc
