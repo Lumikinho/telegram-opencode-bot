@@ -3,6 +3,7 @@
  * processo com teto de rodadas, relançamento via run-hybrid.sh.
  */
 import { type Bot } from "grammy";
+import { existsSync } from "node:fs";
 import { endpoint, ensureServer, refreshEndpointFromEnv, stopServer } from "./opencode.ts";
 import { killAllTurns } from "./turns.ts";
 
@@ -109,11 +110,13 @@ export async function killServers(ports?: Set<number>, timeoutMs = 15_000, maxRo
 
 function respawnBotProcess(): void {
   const root = `${import.meta.dir}/..`;
-  const proc = Bun.spawn(["bash", "run-hybrid.sh"], {
+  const script = existsSync(`${root}/scripts/run-ts.sh`) ? "scripts/run-ts.sh" : "run-hybrid.sh";
+  const args = ["bash", script];
+  const proc = Bun.spawn(args, {
     cwd: root,
     stdin: "ignore",
     stdout: Bun.file(`${root}/bot.log`),
-    stderr: Bun.file(`${root}/bot.log`),
+    stderr: Bun.file(`${root}/bot.err.log`),
     env: { ...process.env },
   });
   proc.unref();

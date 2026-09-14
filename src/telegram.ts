@@ -1,7 +1,6 @@
 /** Bot Telegram (grammy): auth do dono, comandos e texto livre -> opencode v2. */
 import { Bot, InlineKeyboard } from "grammy";
 import {
-  BATTERY_LOW_PCT,
   BOT_TOKEN,
   OPENCODE_DIR,
   OWNER_ID,
@@ -25,6 +24,8 @@ import {
   type SessionSummary,
 } from "./opencode.ts";
 import { batteryOnce, funnelOff, funnelOn, funnelStatus, turnTelegramHtml } from "./workers.ts";
+import { batteryWatch } from "./battery.ts";
+import { EXEC_HELP, cancelExecs, formatExecResult, runExec } from "./exec.ts";
 import { loadChats, saveChat } from "./store.ts";
 import { getStartupInfo, startupMarkdown } from "./version.ts";
 import { captionOf, collectMedia, downloadParts } from "./media.ts";
@@ -118,10 +119,10 @@ export function createBot(): Bot {
   });
 
   bot.command("start", (ctx) => ctx.reply(
-    "opencode bot híbrido (Bun+TS+Python) online.\nUse /menu, /new, /status, /bateria, /funnel.",
+    "opencode bot híbrido (Bun+TS+Python) online.\nUse /menu, /new, /status, /bateria, /funnel, /exec.",
   ));
   bot.command("help", (ctx) => ctx.reply(
-    "/menu /new /cancel /status /bateria /funnel /models /agents /sessions /restart",
+    "/menu /new /cancel /status /bateria /funnel /models /agents /sessions /restart\n" + EXEC_HELP,
   ));
   bot.command("menu", (ctx) => ctx.reply("Painel:", { reply_markup: menuKeyboard() }));
 
@@ -136,8 +137,9 @@ export function createBot(): Bot {
   bot.command("cancel", async (ctx) => {
     const sid = cfgFor(ctx.chat.id).sid;
     if (sid) await interruptSession(sid);
+    const killedExec = await cancelExecs(ctx.chat.id);
     const had = await cancelTurn(bot, ctx.chat.id);
-    await ctx.reply(had ? "⏹ Resposta interrompida." : "⏹ Nada em andamento.");
+    await ctx.reply(killedExec || had ? "⏹ Interrompido (turno/exec)." : "⏹ Nada em andamento.");
   });
 
   bot.command("status", async (ctx) => {
@@ -178,6 +180,18 @@ export function createBot(): Bot {
       await ctx.reply(`❌ funnel: ${e}`.slice(0, 400));
     }
   });
+
+  async function handleExec(ctx: { match?: unknown; chat: { id: number }; reply: (t: string, o?: Record<string, unknown>) => Promise<unknown> }): Promise<void> {
+    const raw = String((ctx.match as string | undefined) ?? "").trim();
+    if (!raw) {
+      await ctx.reply(`Uso: ${EXEC_HELP}\n\nSem shell: sem pipes/redirecionamentos. /cancel mata o exec.`);
+      return;
+    }
+    const r = await runExec(raw, ctx.chat.id);
+    await ctx.reply(formatExecResult(r), { parse_mode: "HTML" });
+  }
+  bot.command("exec", handleExec);
+  bot.command("sh", handleExec);
 
   bot.command("models", async (ctx) => {
     const arg = ctx.match?.toString().trim();
@@ -403,38 +417,6 @@ export function createBot(): Bot {
   return bot;
 }
 
-async function batteryWatch(bot: Bot): Promise<void> {
-  await Bun.sleep(10_000);
-  let lastStatus: string | null = null;
-  let fullNotified = false;
-  const { BATTERY_CHECK_INTERVAL } = await import("./config.ts");
-  for (;;) {
-    try {
-      const b = await batteryOnce();
-      const pct = b.capacity !== null ? parseInt(b.capacity, 10) : NaN;
-      const status = b.status ?? "Unknown";
-      const chatId = ownerChatId();
-      if (lastStatus !== null && lastStatus !== status) {
-        if (status === "Charging") await bot.api.sendMessage(chatId, `🔌 *Carregador conectado* (${b.capacity}%).`, { parse_mode: "Markdown" });
-        else if (status === "Discharging") await bot.api.sendMessage(chatId, `🔋 *Na bateria* (${b.capacity}%).`, { parse_mode: "Markdown" });
-      }
-      if (status === "Full" && !fullNotified) {
-        fullNotified = true;
-        await bot.api.sendMessage(chatId, "🔋 *Carga completa!*", { parse_mode: "Markdown" });
-      } else if (status !== "Full") {
-        fullNotified = false;
-      }
-      if (Number.isFinite(pct) && pct <= BATTERY_LOW_PCT && status !== "Charging" && status !== "Full") {
-        await bot.api.sendMessage(chatId, `⚠️ *Bateria baixa!* ${pct}% restante.`, { parse_mode: "Markdown" });
-      }
-      lastStatus = status;
-    } catch (e) {
-      console.warn("battery watch:", e);
-    }
-    await Bun.sleep(BATTERY_CHECK_INTERVAL * 1000);
-  }
-}
-
 export async function bootstrap(): Promise<Bot> {
   if (!storeReady) {
     try {
@@ -448,7 +430,7 @@ export async function bootstrap(): Promise<Bot> {
   sessions = await listSessions();
   const bot = createBot();
   void consumeEvents((ev) => void routeEvent(bot, ev), () => stopSse);
-  void batteryWatch(bot).catch((e) => console.warn("batteryWatch saiu:", e));
+  void batteryWatch(bot, () => stopSse).catch((e) => console.warn("batteryWatch saiu:", e));
   await announceOnline(bot).catch((e) => console.warn("aviso de boot falhou:", e));
   return bot;
 }
