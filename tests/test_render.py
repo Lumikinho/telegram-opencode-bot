@@ -6,6 +6,7 @@ from bot.render import (
     _redact_secrets,
     _split_text,
     _telegram_html,
+    _todo_lines,
 )
 
 
@@ -42,3 +43,23 @@ def test_split_text_splits_long():
 
 def test_split_text_short_passthrough():
     assert _split_text("curto") == ["curto"]
+
+
+def test_todo_lines_mostra_itens_e_status():
+    todos = [
+        {"content": "Criar teste", "status": "completed"},
+        {"content": "Rodar pytest", "status": "in_progress"},
+        {"content": "Subir bot", "status": "pending"},
+        {"content": "Ignorado", "status": "cancelled"},
+    ]
+    lines = _todo_lines(todos)
+    text = "\n".join(lines)
+    assert "Criar teste" in text and "✅" in text
+    assert "Rodar pytest" in text and "🔄" in text
+    assert "Subir bot" in text and "⬜" in text
+    assert "Ignorado" not in text
+
+
+def test_todo_lines_vazio():
+    assert _todo_lines([]) == []
+    assert _todo_lines(None) == []

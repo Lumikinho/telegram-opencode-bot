@@ -34,7 +34,7 @@ def test_register_handlers_cobre_comandos():
         elif isinstance(h, MessageHandler):
             n_msg += 1
     for esperado in ("start", "help", "new", "cancel", "status", "restart",
-                     "bateria", "models", "agents", "sessions", "mcp",
-                     "version", "summarize", "stats"):
+                     "bateria", "funnel", "unfunnel", "models", "agents",
+                     "sessions", "mcp", "version", "summarize", "stats"):
         assert esperado in cmds, esperado
     assert n_cb >= 4 and n_msg >= 2

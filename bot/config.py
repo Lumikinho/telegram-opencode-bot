@@ -26,6 +26,11 @@ CHAT_ID = os.getenv("CHAT_ID", "")
 OPENCODE_DIR = os.getenv("OPENCODE_DIR", str(Path.home()))
 OC_PORT = int(os.getenv("OPENCODE_SERVER_PORT", "4100"))
 OC_URL = os.getenv("OPENCODE_SERVER_URL", f"http://127.0.0.1:{OC_PORT}")
+# Senha do `opencode serve` v2 (auth Basic obrigatória). Quando o bot sobe o
+# servidor, ele injeta essa senha via OPENCODE_PASSWORD; se vazia, o bot gera
+# uma aleatória por boot. Para conectar num servidor já em execução, defina a
+# mesma senha aqui.
+OC_PASSWORD = os.getenv("OPENCODE_SERVER_PASSWORD", "")
 BATTERY_PATH = os.getenv("BATTERY_PATH", "/sys/class/power_supply/battery")
 BATTERY_CHECK_INTERVAL = int(os.getenv("BATTERY_CHECK_INTERVAL", "30") or "30")
 BATTERY_LOW_PCT = int(os.getenv("BATTERY_LOW_PCT", "20") or "20")

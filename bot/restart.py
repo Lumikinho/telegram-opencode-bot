@@ -121,13 +121,13 @@ async def _kill_opencode_servers(ports: set[int] | None = None, timeout: float =
 def _spawn_bot_process():
     """Relaça o bot num processo destacado, com o mesmo run.sh com que foi iniciado,
     para sobreviver ao encerramento do processo atual."""
-    bot_dir = Path(__file__).parent
-    log_path = bot_dir / "bot.log"
+    repo_root = Path(__file__).resolve().parent.parent
+    log_path = repo_root / "bot.log"
     log_fh = open(log_path, "ab", buffering=0)
     try:
         proc = subprocess.Popen(
             ["bash", "run.sh"],
-            cwd=str(bot_dir),
+            cwd=str(repo_root),
             stdin=subprocess.DEVNULL,
             stdout=log_fh,
             stderr=subprocess.STDOUT,

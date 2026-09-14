@@ -5,9 +5,10 @@ from telegram.ext import CallbackQueryHandler
 from telegram.ext import CommandHandler
 from telegram.ext import MessageHandler
 from telegram.ext import filters
-from .callbacks import cb_command, cb_permission, cb_question, cb_reply
+from .callbacks import cb_command, cb_menu, cb_permission, cb_question, cb_reply, cb_session
 from .chat import handle_chat, handle_media
-from .commands import cmd_agents, cmd_bateria, cmd_cancel, cmd_help, cmd_mcp, cmd_models, cmd_new, cmd_restart, cmd_sessions, cmd_start, cmd_stats, cmd_status, cmd_summarize, cmd_version
+from .commands import cmd_agents, cmd_bateria, cmd_cancel, cmd_funnel, cmd_help, cmd_mcp, cmd_menu, cmd_models, cmd_new, cmd_restart, cmd_sessions, cmd_start, cmd_stats, cmd_status, cmd_summarize, cmd_unfunnel, cmd_version
+from .commands import cb_funnel
 
 
 def register_handlers(app: Application) -> None:
@@ -25,9 +26,15 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("bateria", cmd_bateria))
     app.add_handler(CommandHandler("restart", cmd_restart))
+    app.add_handler(CommandHandler("menu", cmd_menu))
+    app.add_handler(CommandHandler("funnel", cmd_funnel))
+    app.add_handler(CommandHandler("unfunnel", cmd_unfunnel))
+    app.add_handler(CallbackQueryHandler(cb_menu, pattern=r"^menu:"))
+    app.add_handler(CallbackQueryHandler(cb_funnel, pattern=r"^fn:"))
     app.add_handler(CallbackQueryHandler(cb_permission, pattern=r"^perm:"))
     app.add_handler(CallbackQueryHandler(cb_question, pattern=r"^q[ostcr]:"))
     app.add_handler(CallbackQueryHandler(cb_reply, pattern=r"^mod:"))
+    app.add_handler(CallbackQueryHandler(cb_session, pattern=r"^ses:"))
     app.add_handler(CallbackQueryHandler(cb_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_chat))
     app.add_handler(MessageHandler(filters.ATTACHMENT, handle_media))

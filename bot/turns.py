@@ -17,8 +17,10 @@ logger = logging.getLogger(__name__)
 
 
 async def oc_abort(sid: str):
+    if not sid:
+        return
     try:
-        await state._client.post(f"/session/{sid}/abort")
+        await state._client.post(f"/api/session/{sid}/interrupt")
     except Exception as e:
         logger.debug("Falha ao abortar sessão %s: %s", (sid or "")[-6:], e)
 
@@ -223,6 +225,7 @@ def _new_turn_skeleton(chat_id: int) -> dict:
         "busy": True,
         "done": False,
         "todo": 0,
+        "todos": [],
         "reads": set(),
         "writes": set(),
         "edits": set(),
@@ -240,6 +243,7 @@ def _new_turn_skeleton(chat_id: int) -> dict:
         "awaiting_custom": None,
         "typing_task": None,
         "stream_task": None,
+        "tool_names": {},
     }
 
 
@@ -359,7 +363,7 @@ async def _finish_turn(chat_id: int):
 async def _consume_events():
     while True:
         try:
-            async with state._client.stream("GET", "/event") as resp:
+            async with state._client.stream("GET", "/api/event") as resp:
                 async for raw in resp.aiter_lines():
                     line = raw.strip()
                     if not line.startswith("data:"):
@@ -376,45 +380,89 @@ async def _consume_events():
             await asyncio.sleep(3)
 
 
+def _add_form_questions(turn: dict, form: dict):
+    """Converte um form v2 (`form.created`) nas perguntas internas do bot.
+
+    Cada campo vira um item de pergunta; na resposta, os valores são
+    remontados em `{nome_do_campo: valor}` para `POST .../form/{id}/reply`."""
+    fid = form.get("id") or ""
+    sid = form.get("sessionID") or turn.get("sid")
+    fields = form.get("fields") or []
+    title = form.get("title") or ""
+    for idx, f in enumerate(fields):
+        ftype = f.get("type") or "string"
+        fname = f.get("name") or f.get("title") or f"field_{idx}"
+        flabel = f.get("title") or fname
+        fdesc = f.get("description") or ""
+        question = f"{flabel}\n{fdesc}".strip() if fdesc else (flabel or "Responda:")
+        options: list[dict] = []
+        multiple = False
+        custom = False
+        if ftype == "multiselect":
+            multiple = True
+            for o in f.get("options") or []:
+                options.append({"label": o.get("label") or o.get("value"), "value": o.get("value", o.get("label"))})
+        elif ftype == "boolean":
+            options = [{"label": "Sim", "value": True}, {"label": "Não", "value": False}]
+        elif isinstance(f.get("options"), list) and f.get("options"):
+            for o in f["options"]:
+                options.append({"label": o.get("label") or o.get("value"), "value": o.get("value", o.get("label"))})
+            custom = bool(f.get("custom", False))
+        else:
+            custom = True
+        if ftype == "external" and f.get("url"):
+            question = f"{question}\n{f['url']}".strip()
+            custom = True
+        turn["questions"].append({
+            "request_id": fid,
+            "sid": sid,
+            "qidx": idx,
+            "qlen": len(fields),
+            "header": title,
+            "question": question,
+            "options": options,
+            "multiple": multiple,
+            "custom": custom,
+            "answer": None,
+            "field": fname,
+            "ftype": ftype,
+        })
+
+
 async def _dispatch(event: dict):
+    # Envelope v2: {id, created, type, location, data}. (O v1 usava `properties`.)
+    # Exceção: `form.*` aninha tudo em `data.form` (com sessionID próprio).
     et = event.get("type")
-    props = event.get("properties") or {}
-    sid = props.get("sessionID")
+    data = event.get("data") or event.get("properties") or {}
+    sid = data.get("sessionID") or (data.get("form") or {}).get("sessionID")
     turn = _find_turn(sid) if sid else None
     if not turn:
         return
 
     if et == "permission.asked":
-        p = {"id": props.get("id"), "sid": sid, "permission": props.get("permission"), "title": props.get("title") or "", "pattern": props.get("pattern")}
+        p = {
+            "id": data.get("id"),
+            "sid": sid,
+            "permission": data.get("action") or "permissão",
+            "title": data.get("message") or data.get("action") or "",
+            "pattern": ", ".join(data.get("resources") or []),
+        }
         turn["perm_queue"].append(p)
         await _push_status(turn, force=True)
-    elif et == "question.asked":
-        rid = props.get("id") or ""
-        questions = props.get("questions") or []
-        qlen = len(questions)
-        for idx, q in enumerate(questions):
-            turn["questions"].append({
-                "request_id": rid,
-                "sid": sid,
-                "qidx": idx,
-                "qlen": qlen,
-                "header": q.get("header") or "",
-                "question": q.get("question") or "",
-                "options": q.get("options") or [],
-                "multiple": bool(q.get("multiple")),
-                "custom": q.get("custom", True),
-                "answer": None,
-            })
+    elif et == "permission.replied":
+        rid = data.get("requestID") or data.get("id") or ""
+        turn["perm_queue"] = deque(
+            p for p in turn["perm_queue"] if p.get("id") != rid
+        )
         await _push_status(turn, force=True)
-    elif et == "question.rejected":
-        _drop_questions(turn, props.get("requestID") or props.get("id") or "")
+    elif et == "form.created":
+        _add_form_questions(turn, data.get("form") or {})
         await _push_status(turn, force=True)
-    elif et == "message.updated":
-        info = props.get("info") or {}
-        if info.get("role") == "user":
-            turn["user_msg_id"] = info.get("id")
+    elif et in ("form.cancelled", "form.replied"):
+        _drop_questions(turn, (data.get("form") or {}).get("id") or data.get("id") or "")
+        await _push_status(turn, force=True)
     elif et == "session.status":
-        st = props.get("status", {})
+        st = data.get("status", {})
         stype = st.get("type")
         if stype == "busy":
             turn["busy"] = True
@@ -426,37 +474,48 @@ async def _dispatch(event: dict):
             # here too (finish is idempotent via state.TURNS.pop) avoids a turn that
             # never closes.
             await _finish_turn(turn["chat_id"])
+        # "retry" é transitório: mantém o turno vivo sem mexer no typing.
     elif et == "session.idle":
         await _finish_turn(turn["chat_id"])
-    elif et == "session.error":
-        turn["out_text"] = f"❌ *Erro no opencode:* {props.get('error') or props.get('message') or 'desconhecido'}"
+    elif et in ("session.execution.succeeded", "session.execution.interrupted"):
         await _finish_turn(turn["chat_id"])
-    elif et == "todo.updated":
-        todos = props.get("todos") or []
-        turn["todo"] = len([t for t in todos if t.get("status") not in ("cancelled", "completed")])
+    elif et == "session.execution.failed":
+        err = data.get("error") or data.get("message") or "desconhecido"
+        turn["out_text"] = f"❌ *Erro no opencode:* {err}"
+        await _finish_turn(turn["chat_id"])
+    elif et == "session.error":
+        turn["out_text"] = f"❌ *Erro no opencode:* {data.get('error') or data.get('message') or 'desconhecido'}"
+        await _finish_turn(turn["chat_id"])
+    elif et == "session.text.delta":
+        turn["out_text"] += data.get("delta", "")
+    elif et == "session.reasoning.delta":
+        pass
+    elif et == "session.tool.called":
+        name = data.get("name") or "ferramenta"
+        if data.get("id"):
+            turn["tool_names"][data["id"]] = {"name": name, "input": data.get("input") or {}}
+        _record_tool(turn, {
+            "tool": name,
+            "id": data.get("id"),
+            "state": {"status": "running", "input": data.get("input") or {}},
+        })
         await _push_status(turn)
-    elif et == "message.part.updated":
-        part = props.get("part") or {}
-        ptype = part.get("type")
-        if ptype == "tool":
-            _record_tool(turn, part)
-            await _push_status(turn)
-        elif ptype == "reasoning":
-            # Remember this part's id so the delta handler below can tell the
-            # model's internal chain-of-thought apart from its real answer --
-            # both can arrive as field="text" deltas, and without this the
-            # reasoning gets appended straight into the final answer bubble.
-            pid = part.get("id")
-            if pid:
-                turn["reasoning_part_ids"].add(pid)
-    elif et == "message.part.delta":
-        part_id = props.get("partID") or props.get("partId") or props.get("id")
-        if part_id and part_id in turn["reasoning_part_ids"]:
-            return
-        if props.get("field") == "text" and props.get("messageID") != turn.get("user_msg_id"):
-            turn["out_text"] += props.get("delta", "")
+    elif et in ("session.tool.success", "session.tool.failed"):
+        seen = turn["tool_names"].pop(data.get("id") or "", None) or {}
+        name = seen.get("name") or "ferramenta"
+        status = "completed" if et == "session.tool.success" else "error"
+        if status == "error" and "permission" in str(data.get("error") or "").lower():
+            turn["rejected"] += 1
+        _record_tool(turn, {
+            "tool": name,
+            "id": data.get("id"),
+            "state": {"status": status, "input": seen.get("input") or {}, "output": ""},
+        })
+        await _push_status(turn)
+    elif et == "session.tool.progress":
+        pass
     elif et == "file.edited":
-        f = props.get("file")
+        f = data.get("file")
         if f:
             turn["edits"].add(f)
             await _push_status(turn)
@@ -484,7 +543,24 @@ async def _submit_question(turn: dict, request_id: str) -> bool:
         answers[q["qidx"]] = list(a)
     if any(a is None for a in answers):
         return False
-    ok = await oc_answer_question(request_id, answers)
+    # Remonta a resposta do form v2: {nome_do_campo: valor}.
+    form_answer: dict = {}
+    for q, a in zip(items, [answers[q["qidx"]] for q in items]):
+        ftype = q.get("ftype") or "string"
+        if ftype == "multiselect":
+            form_answer[q["field"]] = list(a)
+            continue
+        val = a[0] if a else None
+        if ftype == "boolean":
+            form_answer[q["field"]] = bool(val) if not isinstance(val, bool) else val
+        elif ftype in ("number", "integer"):
+            try:
+                form_answer[q["field"]] = float(val) if ftype == "number" else int(val)
+            except (TypeError, ValueError):
+                form_answer[q["field"]] = val
+        else:
+            form_answer[q["field"]] = val
+    ok = await oc_answer_question(turn.get("sid") or "", request_id, form_answer)
     _drop_questions(turn, request_id)
     return ok
 

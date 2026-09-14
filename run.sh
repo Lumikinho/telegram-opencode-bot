@@ -17,5 +17,12 @@ if [ ! -f ".env" ]; then
     exit 1
 fi
 
+# O .env é a fonte da verdade: exporta por cima de qualquer valor herdado
+# (tmux/session), senão o python herdaria ex. OPENCODE_SERVER_PORT antigo.
+set -a
+# shellcheck disable=SC1091
+source .env
+set +a
+
 echo "Starting opencode bot..."
 python3 -m bot

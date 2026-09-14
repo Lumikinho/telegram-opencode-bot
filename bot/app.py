@@ -10,7 +10,7 @@ from .auth import _get_owner_chat
 from .battery import _battery_watch
 from .config import BOT_TOKEN
 from .handlers import register_handlers
-from .opencode import oc_ensure_server, oc_stop_server
+from .opencode import oc_ensure_server, oc_list_sessions, oc_restore_chat_session, oc_stop_server
 from .render import _safe_send_message
 from .turns import _consume_events, _stop_stream, _stop_typing
 
@@ -26,6 +26,7 @@ async def post_init(app: Application):
     if state._battery_task is None:
         state._battery_task = asyncio.create_task(_battery_watch())
     await app.bot.set_my_commands([
+        BotCommand("menu", "Painel com botões"),
         BotCommand("help", "Lista de comandos"),
         BotCommand("new", "Nova conversa"),
         BotCommand("cancel", "Interrompe a resposta"),
@@ -38,15 +39,25 @@ async def post_init(app: Application):
         BotCommand("version", "Versão do opencode"),
         BotCommand("status", "Estado do servidor"),
         BotCommand("bateria", "Bateria e alertas de nível baixo"),
+        BotCommand("funnel", "Liga/desliga o funnel Tailscale"),
         BotCommand("restart", "Reiniciar bot / servidor"),
     ])
     chat_id = _get_owner_chat()
     if chat_id:
-        await _safe_send_message(
-            app.bot, chat_id,
-            "✅ *opencode bot online v" + config.VERSION + "* — conectado ao servidor.",
-            parse_mode="Markdown",
-        )
+        chats = app.bot_data.setdefault("chats", {})
+        chats.setdefault(chat_id, {})
+        sessions = await oc_list_sessions()
+        lines = []
+        for cid, cfg in chats.items():
+            sid, created = await oc_restore_chat_session(cfg, sessions)
+            if not sid:
+                continue
+            verbo = "criada" if created else "retomada"
+            lines.append(f"🔌 conectado a sessão ({verbo}): `{sid}`")
+        text = "✅ *opencode bot online v" + config.VERSION + "* — conectado ao servidor."
+        if lines:
+            text += "\n" + "\n".join(lines)
+        await _safe_send_message(app.bot, chat_id, text, parse_mode="Markdown")
 
 
 async def post_shutdown(app: Application):

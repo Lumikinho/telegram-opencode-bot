@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from . import state
+from .opencode import oc_mcp_remove, oc_mcp_set
 
 
 logger = logging.getLogger(__name__)
@@ -350,8 +351,9 @@ async def _mcp_set_server(name: str, url: str, headers: dict | None = None) -> s
     except Exception as e:
         return f"❌ falha ao gravar config: {e}"
     try:
-        r = await state._client.post("/mcp", json={"name": name, "config": cfg})
-        r.raise_for_status()
+        ok = await oc_mcp_set(name, cfg)
+        if not ok:
+            raise RuntimeError("servidor não confirmou")
         return f"✅ `{name}` configurado (arquivo + servidor em execução)."
     except Exception as e:
         return f"⚠️ Config salva no arquivo, mas o servidor não aplicou: {e}"
@@ -390,8 +392,9 @@ async def _mcp_remove_server(name: str, raw: str) -> str:
     except Exception as e:
         return f"❌ falha ao remover do arquivo: {e}"
     try:
-        r = await state._client.request("DELETE", f"/mcp/{name}")
-        r.raise_for_status()
+        ok = await oc_mcp_remove(name)
+        if not ok:
+            raise RuntimeError("servidor não confirmou")
         return f"✅ `{name}` removido."
     except Exception as e:
         return f"⚠️ Removido do arquivo, mas o servidor não confirmou: {e}"

@@ -143,6 +143,60 @@ def _kb_restart() -> InlineKeyboardMarkup:
     ])
 
 
+def _kb_menu(server_ok: bool | None = None) -> InlineKeyboardMarkup:
+    """Painel principal interativo: Status / Opencode / Servidor.
+
+    server_ok=None = estado desconhecido (mostra ⚪); True=🟢, False=🔴."""
+    dot = "⚪" if server_ok is None else ("🟢" if server_ok else "🔴")
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"{dot} Status", callback_data="menu:status"),
+         InlineKeyboardButton("🔄 Atualizar", callback_data="menu:refresh")],
+        [InlineKeyboardButton("🤖 Opencode", callback_data="menu:opencode"),
+         InlineKeyboardButton("🖥️ Servidor", callback_data="menu:server")],
+        [InlineKeyboardButton("📋 Menu completo", callback_data="/help")],
+    ])
+
+
+def _kb_menu_opencode() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Nova conversa", callback_data="/new"),
+         InlineKeyboardButton("📑 Sessões", callback_data="/sessions")],
+        [InlineKeyboardButton("🧠 Modelos", callback_data="/models"),
+         InlineKeyboardButton("🛠️ Agentes", callback_data="/agents")],
+        [InlineKeyboardButton("📊 Resumo", callback_data="menu:summarize"),
+         InlineKeyboardButton("💰 Stats", callback_data="/stats")],
+        [InlineKeyboardButton("◀️ Voltar", callback_data="menu:main")],
+    ])
+
+
+def _kb_menu_server(server_ok: bool) -> InlineKeyboardMarkup:
+    dot = "🟢" if server_ok else "🔴"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"{dot} Status servidor", callback_data="menu:status"),
+         InlineKeyboardButton("🔄 Atualizar", callback_data="menu:refresh")],
+        [InlineKeyboardButton("🖥️ Reiniciar servidor", callback_data="__restart:server"),
+         InlineKeyboardButton("🔁 Bot + servidor", callback_data="__restart:both")],
+        [InlineKeyboardButton("🌐 Funnel", callback_data="menu:funnel"),
+         InlineKeyboardButton("🔋 Bateria", callback_data="menu:battery")],
+        [InlineKeyboardButton("◀️ Voltar", callback_data="menu:main")],
+    ])
+
+
+def _menu_main_text(server_ok: bool | None, latency_ms: int | None = None) -> str:
+    if server_ok is None:
+        state_line = "⚪ *Servidor:* verificando…"
+    elif server_ok:
+        extra = f" ({latency_ms}ms)" if latency_ms is not None else ""
+        state_line = f"🟢 *Servidor:* ATIVO{extra}"
+    else:
+        state_line = "🔴 *Servidor:* DESATIVADO"
+    return (
+        "🤖 *Painel opencode*\n\n"
+        f"{state_line}\n\n"
+        "Escolha uma área abaixo:"
+    )
+
+
 _RESTART_ALIASES = {
     "bot": "bot",
     "server": "server", "servidor": "server", "srv": "server",
@@ -286,10 +340,32 @@ def _q_kb(turn: dict) -> list[list[InlineKeyboardButton]]:
     return rows
 
 
+def _todo_icon(status: str) -> str:
+    s = (status or "").lower().replace("-", "_")
+    if s == "completed":
+        return "✅"
+    if s == "in_progress":
+        return "🔄"
+    return "⬜"
+
+
+def _todo_lines(todos: list[dict], max_items: int = 20) -> list[str]:
+    """Lista os to-do's do agente com o estado de cada um, em vez de só a quantidade."""
+    items = [t for t in (todos or []) if (t.get("status") or "") != "cancelled"][:max_items]
+    if not items:
+        return []
+    lines = ["📋 *To-do's:*"]
+    for t in items:
+        content = (t.get("content") or "").strip().replace("\n", " ")
+        if len(content) > 80:
+            content = content[:79] + "…"
+        lines.append(f"{_todo_icon(t.get('status') or '')} {content}")
+    return lines
+
+
 def _render_running(turn: dict) -> tuple[str, InlineKeyboardMarkup | None]:
     lines = []
-    if turn["todo"]:
-        lines.append(f"📋 *Plano:* {turn['todo']} passo{'s' if turn['todo'] != 1 else ''}")
+    lines += _todo_lines(turn.get("todos") or [])
     has_prompt = bool(turn["questions"]) or bool(turn["perm_queue"])
     if turn["questions"]:
         lines += _q_lines(turn)
@@ -316,6 +392,7 @@ def _render_running(turn: dict) -> tuple[str, InlineKeyboardMarkup | None]:
 
 def _summary(turn: dict) -> list[str]:
     out = []
+    out += _todo_lines(turn.get("todos") or [])
     if turn["reads"]:
         out.append("📖 *leu:* " + ", ".join(sorted(f"`{_fmt_path(x)}`" for x in turn["reads"])))
     if turn["writes"]:
