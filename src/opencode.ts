@@ -123,17 +123,14 @@ export async function startServer(): Promise<void> {
     serverPassword = Buffer.from(crypto.getRandomValues(new Uint8Array(18))).toString("base64url");
   }
   const logPath = `${OPENCODE_DIR}/.opencode_bot_server.log`;
-  const logFile = Bun.file(logPath);
-  const logWriter = logFile.writer();
   const proc = Bun.spawn(["opencode", "serve", "--port", String(OC_PORT), "--print-logs"], {
     cwd: OPENCODE_DIR,
-    stdout: "inherit",
-    stderr: "inherit",
+    stdout: Bun.file(logPath),
+    stderr: Bun.file(logPath),
     env: { ...process.env, OPENCODE_PASSWORD: serverPassword },
   });
   serverProc = proc;
   weStartedServer = true;
-  void logWriter;
   for (let i = 0; i < 200; i++) {
     if (await serverOk()) {
       console.log(`opencode server v2 pronto na porta ${OC_PORT}`);

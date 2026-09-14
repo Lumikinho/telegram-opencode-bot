@@ -29,6 +29,7 @@ import {
   type SessionSummary,
 } from "./opencode.ts";
 import { batteryOnce, funnelOff, funnelOn, funnelStatus } from "./workers.ts";
+import { loadChats, saveChat } from "./store.ts";
 import {
   askCustom,
   cancelTurn,
@@ -52,6 +53,7 @@ interface ChatCfg {
 const chats = new Map<number, ChatCfg>();
 let sessions: SessionSummary[] = [];
 let stopSse = false;
+let storeReady = false;
 
 function cfgFor(chatId: number): ChatCfg {
   let c = chats.get(chatId);
@@ -62,6 +64,14 @@ function cfgFor(chatId: number): ChatCfg {
   return c;
 }
 
+function persist(chatId: number): void {
+  try {
+    saveChat(chatId, cfgFor(chatId));
+  } catch (e) {
+    console.warn("store: falha ao salvar chat", chatId, e);
+  }
+}
+
 function isOwner(id?: number): boolean {
   return id === OWNER_ID;
 }
@@ -70,6 +80,7 @@ async function ensureSid(chatId: number): Promise<string | null> {
   const cfg = cfgFor(chatId);
   if (cfg.sid) return cfg.sid;
   const { sid } = await restoreChatSession(cfg, sessions);
+  if (sid) persist(chatId);
   return sid;
 }
 
@@ -107,6 +118,7 @@ export function createBot(): Bot {
   bot.command("new", async (ctx) => {
     const sid = await createSession();
     cfgFor(ctx.chat.id).sid = sid;
+    persist(ctx.chat.id);
     sessions.push({ id: sid, time: { updated: 0 } });
     await ctx.reply(`🆕 sessão criada: \`${sid}\``, { parse_mode: "Markdown" });
   });
@@ -161,6 +173,7 @@ export function createBot(): Bot {
     const arg = ctx.match?.toString().trim();
     if (arg) {
       cfgFor(ctx.chat.id).model = arg;
+      persist(ctx.chat.id);
       await ctx.reply(`Modelo: \`${arg}\``, { parse_mode: "Markdown" });
       return;
     }
@@ -172,6 +185,7 @@ export function createBot(): Bot {
     const arg = ctx.match?.toString().trim();
     if (arg) {
       cfgFor(ctx.chat.id).agent = arg;
+      persist(ctx.chat.id);
       await ctx.reply(`Agente: \`${arg}\``, { parse_mode: "Markdown" });
       return;
     }
@@ -198,6 +212,7 @@ export function createBot(): Bot {
   bot.callbackQuery("menu:new", async (ctx) => {
     const sid = await createSession();
     cfgFor(ctx.chat!.id).sid = sid;
+    persist(ctx.chat!.id);
     await ctx.answerCallbackQuery("sessão criada");
     await ctx.reply(`🆕 \`${sid}\``, { parse_mode: "Markdown" });
   });
@@ -339,6 +354,14 @@ async function batteryWatch(bot: Bot): Promise<void> {
 }
 
 export async function bootstrap(): Promise<Bot> {
+  if (!storeReady) {
+    try {
+      for (const [id, cfg] of loadChats()) chats.set(id, cfg);
+    } catch (e) {
+      console.warn("store: partindo de chats vazios:", e);
+    }
+    storeReady = true;
+  }
   await ensureServer();
   sessions = await listSessions();
   const bot = createBot();

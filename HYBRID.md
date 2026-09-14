@@ -60,6 +60,15 @@ Ações do worker: `new_turn`, `fold` (none|push|push_force|finish),
 `[{text, data}]` (callbacks `perm:`/`qo:`/`qt:`/`qs:`/`qr:`/`qc:`,
 dentro do limite de 64 bytes do Telegram).
 
+## Bun nativo
+
+- `src/store.ts` usa `bun:sqlite` (`HYBRID_DB`, padrão
+  `<OPENCODE_DIR>/.opencode_bot_hybrid.sqlite`): chats (sid/model/agent)
+  e kv sobrevivem a reinícios — substitui o PicklePersistence;
+- `opencode serve` é spawnado com `Bun.spawn`, stdout/stderr direto no
+  log via `Bun.file`, senha com `crypto.getRandomValues`, espera com
+  `Bun.sleep`; SSE via `fetch` + reader nativo.
+
 ## Norma v2 (resumo)
 
 - `Authorization: Basic base64("opencode:<senha>")` em toda rota;
