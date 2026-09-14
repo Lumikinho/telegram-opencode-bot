@@ -88,7 +88,7 @@ export interface FoldResult {
   detail: { reason?: string; error?: string } | null;
 }
 
-async function turnCall(payload: Record<string, unknown>, timeoutMs = 20_000): Promise<Record<string, unknown>> {
+export async function turnCall(payload: Record<string, unknown>, timeoutMs = 20_000): Promise<Record<string, unknown>> {
   const r = (await runPy("py/turn_cli.py", payload, timeoutMs)) as Record<string, unknown>;
   if (r.error) throw new Error(`turn_cli: ${r.error}`);
   return r;
@@ -178,6 +178,16 @@ export async function turnRenderResult(turn: TurnState): Promise<string> {
 export async function turnSplit(text: string, limit = 3500): Promise<string[]> {
   const r = await turnCall({ action: "split", text, limit });
   return (r.chunks as string[]) ?? [text];
+}
+
+export async function turnMediaNote(kind: string, filename: string, sizeMb = 0): Promise<string> {
+  const r = await turnCall({ action: "media_note", kind, filename, size_mb: sizeMb });
+  return r.text as string;
+}
+
+export async function turnSafeFilename(name: string, fallback: string): Promise<string> {
+  const r = await turnCall({ action: "safe_filename", name, default: fallback });
+  return r.filename as string;
 }
 
 export async function turnTelegramHtml(text: string, maxLen = 3800): Promise<string> {

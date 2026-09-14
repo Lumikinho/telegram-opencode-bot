@@ -69,6 +69,17 @@ dentro do limite de 64 bytes do Telegram).
   log via `Bun.file`, senha com `crypto.getRandomValues`, espera com
   `Bun.sleep`; SSE via `fetch` + reader nativo.
 
+## Mídia e restart
+
+- Anexos (foto, documento, áudio, voz, vídeo, vídeo redondo, GIF):
+  `src/media.ts` coleta/download (limite 20 MiB, data URL base64) com
+  nomes/MIME/notas vindos do worker (`safe_filename`, `media_note`,
+  `media_limits`); legenda vira o prompt, notas de anexo falho anexadas;
+- `/restart [bot|servidor|ambos]` em `src/restart.ts`: mata turnos,
+  recicla o servidor (relê porta/URL do `.env`, kill por padrão com teto
+  de 3 rodadas) ou relança o bot via `run-hybrid.sh` + exit; teclado de
+  confirmação `__restart:*` igual ao núcleo Python.
+
 ## Norma v2 (resumo)
 
 - `Authorization: Basic base64("opencode:<senha>")` em toda rota;

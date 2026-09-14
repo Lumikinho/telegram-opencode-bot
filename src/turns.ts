@@ -269,6 +269,21 @@ export async function cancelTurn(bot: Bot, chatId: number): Promise<boolean> {
   return true;
 }
 
+/** Interrompe todos os turnos (port de _kill_all_turns). */
+export async function killAllTurns(bot: Bot, chatId?: number): Promise<void> {
+  const targets = chatId !== undefined ? [chatId] : [...byChat.keys()];
+  for (const cid of targets) {
+    const t = byChat.get(cid);
+    if (!t) continue;
+    const sid = String((t.state as Record<string, unknown>).sid ?? "");
+    if (sid) {
+      const { interruptSession } = await import("./opencode.ts");
+      await interruptSession(sid);
+    }
+    await finishTurn(bot, t);
+  }
+}
+
 // ---- interações de permissão / perguntas (callbacks) ----
 
 export async function replyPermission(bot: Bot, chatId: number, permId: string, reply: "once" | "always" | "reject"): Promise<void> {

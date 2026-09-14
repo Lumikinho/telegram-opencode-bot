@@ -718,6 +718,32 @@ def split_text(text: str, limit: int = 4000) -> list:
     return out
 
 
+_MEDIA_FALLBACK_MIME = {
+    "document": "application/octet-stream",
+    "audio": "audio/mpeg",
+    "voice": "audio/ogg",
+    "video": "video/mp4",
+    "video_note": "video/mp4",
+    "animation": "video/mp4",
+    "photo": "image/jpeg",
+}
+MEDIA_MAX_BYTES = 20 * 1024 * 1024
+
+
+def safe_filename(name: str, default: str) -> str:
+    name = (name or "").strip()
+    name = re.sub(r"[^\w.\-()+\[\] ]", "_", name)[:120].strip()
+    return name or default
+
+
+def media_note(kind: str, filename: str, size_mb: int = 0) -> str:
+    if kind == "oversize":
+        return f"[anexo ignorado ({size_mb} MiB, limite 20 MiB): {filename}]"
+    if kind == "inaccessible":
+        return f"[anexo não acessível: {filename}]"
+    return f"[falha ao baixar anexo: {filename}]"
+
+
 def main() -> None:
     try:
         req = json.loads(sys.stdin.read() or "{}")
@@ -803,6 +829,19 @@ def main() -> None:
                   sys.stdout, ensure_ascii=False)
     elif action == "redact":
         json.dump({"text": redact_secrets(req.get("text") or "")},
+                  sys.stdout, ensure_ascii=False)
+    elif action == "safe_filename":
+        json.dump({"filename": safe_filename(req.get("name") or "",
+                                              req.get("default") or "arquivo.bin")},
+                  sys.stdout, ensure_ascii=False)
+    elif action == "media_note":
+        json.dump({"text": media_note(req.get("kind") or "download_failed",
+                                       req.get("filename") or "anexo",
+                                       int(req.get("size_mb") or 0))},
+                  sys.stdout, ensure_ascii=False)
+    elif action == "media_limits":
+        json.dump({"max_bytes": MEDIA_MAX_BYTES,
+                   "fallback_mime": _MEDIA_FALLBACK_MIME},
                   sys.stdout, ensure_ascii=False)
     else:
         json.dump({"error": f"ação desconhecida: {action}"}, sys.stdout)

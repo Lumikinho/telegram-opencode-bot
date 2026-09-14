@@ -7,6 +7,27 @@
  */
 import { OC_PASSWORD, OC_PORT, OC_URL, OPENCODE_DIR } from "./config.ts";
 
+export const endpoint = { port: OC_PORT, url: OC_URL };
+
+/** Relê porta/URL do `.env` em disco (sem tocar no process.env), para que
+ * o /restart respeite uma mudança de porta feita no arquivo. */
+export async function refreshEndpointFromEnv(): Promise<{ port: number; url: string }> {
+  try {
+    const t = await Bun.file(`${import.meta.dir}/../.env`).text();
+    const vals: Record<string, string> = {};
+    for (const line of t.split(/\r?\n/)) {
+      const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
+      if (m) vals[m[1]] = m[2].replace(/^["']|["']$/g, "");
+    }
+    const raw = (vals.OPENCODE_SERVER_PORT ?? "").trim();
+    if (/^\d+$/.test(raw)) endpoint.port = parseInt(raw, 10);
+    endpoint.url = (vals.OPENCODE_SERVER_URL ?? "").trim() || `http://127.0.0.1:${endpoint.port}`;
+  } catch {
+    /* sem .env legível: mantém o vigente */
+  }
+  return { ...endpoint };
+}
+
 export let serverPassword = OC_PASSWORD;
 
 export function authHeader(pw = serverPassword): Record<string, string> {
@@ -23,7 +44,7 @@ async function api(
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    return await fetch(`${OC_URL}${path}`, {
+    return await fetch(`${endpoint.url}${path}`, {
       ...init,
       signal: ctrl.signal,
       headers: {
@@ -61,8 +82,8 @@ export async function serverInfo(): Promise<ServerInfo> {
     ok: false,
     status: "desativado",
     latencyMs: null,
-    url: OC_URL,
-    port: OC_PORT,
+    url: endpoint.url,
+    port: endpoint.port,
     version: null,
     error: null,
   };
@@ -96,7 +117,7 @@ let weStartedServer = false;
 function killStaleServers(): number[] {
   // Derruba `opencode serve --port <porta>` órfãos de boot anterior.
   try {
-    const out = Bun.spawnSync(["pgrep", "-f", `opencode serve --port ${OC_PORT}`]);
+    const out = Bun.spawnSync(["pgrep", "-f", `opencode serve --port ${endpoint.port}`]);
     const txt = out.stdout.toString();
     const killed: number[] = [];
     for (const line of txt.split(/\r?\n/)) {
@@ -123,7 +144,7 @@ export async function startServer(): Promise<void> {
     serverPassword = Buffer.from(crypto.getRandomValues(new Uint8Array(18))).toString("base64url");
   }
   const logPath = `${OPENCODE_DIR}/.opencode_bot_server.log`;
-  const proc = Bun.spawn(["opencode", "serve", "--port", String(OC_PORT), "--print-logs"], {
+  const proc = Bun.spawn(["opencode", "serve", "--port", String(endpoint.port), "--print-logs"], {
     cwd: OPENCODE_DIR,
     stdout: Bun.file(logPath),
     stderr: Bun.file(logPath),
@@ -133,7 +154,7 @@ export async function startServer(): Promise<void> {
   weStartedServer = true;
   for (let i = 0; i < 200; i++) {
     if (await serverOk()) {
-      console.log(`opencode server v2 pronto na porta ${OC_PORT}`);
+      console.log(`opencode server v2 pronto na porta ${endpoint.port}`);
       return;
     }
     if (proc.exitCode !== null) throw new Error(`opencode serve encerrou sozinho (code=${proc.exitCode})`);
@@ -145,7 +166,7 @@ export async function startServer(): Promise<void> {
 export async function ensureServer(): Promise<void> {
   try {
     if (await serverOk()) {
-      console.log(`Conectado ao opencode server ${OC_URL}`);
+      console.log(`Conectado ao opencode server ${endpoint.url}`);
       return;
     }
   } catch {
@@ -348,7 +369,7 @@ export async function consumeEvents(
 ): Promise<void> {
   while (!shouldStop()) {
     try {
-      const res = await fetch(`${OC_URL}/api/event`, { headers: authHeader() });
+      const res = await fetch(`${endpoint.url}/api/event`, { headers: authHeader() });
       if (!res.ok || !res.body) throw new Error(`event HTTP ${res.status}`);
       const reader = res.body.getReader();
       const dec = new TextDecoder();

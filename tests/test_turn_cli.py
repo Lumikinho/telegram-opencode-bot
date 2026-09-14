@@ -123,3 +123,23 @@ def test_split_quebra_longo():
 def test_acao_desconhecida_erro():
     r = subprocess.run(WORKER, input='{"action": "x"}', capture_output=True, text=True, timeout=30)
     assert "desconhecida" in r.stdout
+
+
+def test_safe_filename_limpa_e_trunca():
+    r = call(None, "safe_filename", name="nota: fiscal/final?.pdf", default="x.bin")
+    assert r["filename"] == "nota_ fiscal_final_.pdf"
+    r = call(None, "safe_filename", name="", default="doc.bin")
+    assert r["filename"] == "doc.bin"
+
+
+def test_media_note_formatos():
+    over = call(None, "media_note", kind="oversize", filename="v.mp4", size_mb=25)
+    assert over["text"] == "[anexo ignorado (25 MiB, limite 20 MiB): v.mp4]"
+    assert call(None, "media_note", kind="inaccessible", filename="a.ogg")["text"] == "[anexo não acessível: a.ogg]"
+    assert call(None, "media_note", kind="download_failed", filename="b")["text"] == "[falha ao baixar anexo: b]"
+
+
+def test_media_limits():
+    r = call(None, "media_limits")
+    assert r["max_bytes"] == 20 * 1024 * 1024
+    assert r["fallback_mime"]["voice"] == "audio/ogg"

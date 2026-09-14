@@ -3,8 +3,6 @@ import { Bot, InlineKeyboard } from "grammy";
 import {
   BATTERY_LOW_PCT,
   BOT_TOKEN,
-  OC_PORT,
-  OC_URL,
   OPENCODE_DIR,
   OWNER_ID,
   VERSION,
@@ -24,12 +22,12 @@ import {
   restoreChatSession,
   sendMessage,
   serverInfo,
-  stopServer,
-  type ServerEvent,
   type SessionSummary,
 } from "./opencode.ts";
 import { batteryOnce, funnelOff, funnelOn, funnelStatus } from "./workers.ts";
 import { loadChats, saveChat } from "./store.ts";
+import { captionOf, collectMedia, downloadParts } from "./media.ts";
+import { RESTART_LABELS, parseRestartTarget, performRestart, restartConfirmKeyboard } from "./restart.ts";
 import {
   askCustom,
   cancelTurn,
@@ -94,6 +92,17 @@ export function menuKeyboard(): InlineKeyboard {
     .row()
     .text("🔌 funnel on", "menu:funnel-on")
     .text("🔌 funnel off", "menu:funnel-off");
+}
+
+function buttonGrid(rows: { text: string; data: string }[][]): InlineKeyboard {
+  let kb = new InlineKeyboard();
+  rows.forEach((row, ri) => {
+    row.forEach((b) => {
+      kb = kb.text(b.text, b.data);
+    });
+    if (ri < rows.length - 1) kb = kb.row();
+  });
+  return kb;
 }
 
 export function createBot(): Bot {
@@ -199,14 +208,30 @@ export function createBot(): Bot {
   });
 
   bot.command("restart", async (ctx) => {
-    const arg = (ctx.match?.toString().trim().toLowerCase() || "bot") as string;
-    if (arg === "servidor" || arg === "server") {
-      await stopServer();
-      await ensureServer();
-      await ctx.reply("🔄 servidor reiniciado.");
-    } else {
-      await ctx.reply("🔄 reinicie o processo (systemd/tmux).");
+    const arg = ctx.match?.toString().trim();
+    if (arg) {
+      const target = parseRestartTarget(arg);
+      if (!target) {
+        await ctx.reply("Uso: `/restart` ou `/restart bot|servidor|ambos`", { parse_mode: "Markdown" });
+        return;
+      }
+      await performRestart(bot, ctx.chat.id, target);
+      return;
     }
+    await ctx.reply("⚠️ *Reiniciar o quê?*\n\nRespostas em andamento serão interrompidas.", {
+      parse_mode: "Markdown",
+      reply_markup: buttonGrid(restartConfirmKeyboard()),
+    });
+  });
+  bot.callbackQuery(/^__restart:(bot|server|both)$/, async (ctx) => {
+    const target = (ctx.match as RegExpMatchArray)[1] as "bot" | "server" | "both";
+    await ctx.answerCallbackQuery(`reiniciando ${RESTART_LABELS[target]}`);
+    try {
+      await ctx.editMessageText(`🔁 *Reiniciando ${RESTART_LABELS[target]}...*`, { parse_mode: "Markdown" });
+    } catch {
+      /* segue para o restart mesmo sem editar */
+    }
+    await performRestart(bot, ctx.chat!.id, target);
   });
 
   bot.callbackQuery("menu:new", async (ctx) => {
@@ -318,6 +343,62 @@ export function createBot(): Bot {
     }
   });
 
+  bot.callbackQuery("/status", async (ctx) => {
+    const info = await serverInfo();
+    await ctx.answerCallbackQuery(info.ok ? "servidor ativo" : "servidor parado");
+    await ctx.reply(`${info.ok ? "🟢" : "🔴"} ${info.status} — ${info.url}`);
+  });
+
+  bot.on(
+    [
+      "message:photo",
+      "message:document",
+      "message:audio",
+      "message:voice",
+      "message:video",
+      "message:video_note",
+      "message:animation",
+    ],
+    async (ctx) => {
+      const text = await captionOf(ctx);
+      if (text && (await consumeCustomAnswer(bot, ctx.chat.id, text))) return;
+      const entries = await collectMedia(ctx);
+      if (!entries.length && !text) {
+        await ctx.reply(
+          "⚠️ Anexos suportados: foto, documento, áudio, voz, vídeo e GIF.\nEnvie junto um texto ou legenda com a instrução.",
+        );
+        return;
+      }
+      const target = await ensureSid(ctx.chat.id);
+      if (!target) {
+        await ctx.reply("❌ sem sessão (servidor fora?).");
+        return;
+      }
+      const cfg = cfgFor(ctx.chat.id);
+      const parts = entries.length ? await downloadParts(bot, entries) : [];
+      const files = parts.filter((p) => p.type === "file");
+      const notes = parts.filter((p) => p.type === "text").map((p) => (p as { text: string }).text);
+      const prompt = [text, ...notes].filter(Boolean).join("\n");
+      const turn = await startTurn(bot, ctx.chat.id, target);
+      if (!turn) return;
+      try {
+        await sendMessage(target, prompt, {
+          model: cfg.model,
+          agent: cfg.agent,
+          files: files as { type: "file"; url: string; filename?: string }[],
+        });
+      } catch (e) {
+        await ctx.reply(`❌ falha ao enviar: ${e}`.slice(0, 500));
+        const live = getTurn(ctx.chat.id);
+        if (live) {
+          const { finishTurn } = await import("./turns.ts");
+          (live.state as Record<string, unknown>).out_text = `❌ Falha ao enviar para o opencode: ${e}`;
+          await finishTurn(bot, live);
+        }
+      }
+    },
+  );
+
   return bot;
 }
 
@@ -373,5 +454,3 @@ export async function bootstrap(): Promise<Bot> {
 export function shutdown(): void {
   stopSse = true;
 }
-
-export { OC_PORT, OC_URL };
