@@ -24,8 +24,9 @@ import {
   serverInfo,
   type SessionSummary,
 } from "./opencode.ts";
-import { batteryOnce, funnelOff, funnelOn, funnelStatus } from "./workers.ts";
+import { batteryOnce, funnelOff, funnelOn, funnelStatus, turnTelegramHtml } from "./workers.ts";
 import { loadChats, saveChat } from "./store.ts";
+import { getStartupInfo, startupMarkdown } from "./version.ts";
 import { captionOf, collectMedia, downloadParts } from "./media.ts";
 import { RESTART_LABELS, parseRestartTarget, performRestart, restartConfirmKeyboard } from "./restart.ts";
 import {
@@ -448,7 +449,14 @@ export async function bootstrap(): Promise<Bot> {
   const bot = createBot();
   void consumeEvents((ev) => void routeEvent(bot, ev), () => stopSse);
   void batteryWatch(bot).catch((e) => console.warn("batteryWatch saiu:", e));
+  await announceOnline(bot).catch((e) => console.warn("aviso de boot falhou:", e));
   return bot;
+}
+
+async function announceOnline(bot: Bot): Promise<void> {
+  const info = await getStartupInfo();
+  const html = await turnTelegramHtml(startupMarkdown(info), 3500);
+  await bot.api.sendMessage(ownerChatId(), html, { parse_mode: "HTML" });
 }
 
 export function shutdown(): void {

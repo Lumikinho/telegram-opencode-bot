@@ -1,6 +1,6 @@
 {
   "name": "telegram-opencode-bot-hybrid",
-  "version": "2.0.0-hybrid.0",
+  "version": "2.0.0-hybrid.1",
   "description": "Telegram opencode bot — Bun+TS gateway, Python workers, opencode server v2",
   "type": "module",
   "scripts": {

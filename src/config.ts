@@ -1,7 +1,7 @@
 import "dotenv/config";
 import { homedir } from "node:os";
 
-export const VERSION = "2.0.0-hybrid.0";
+export const VERSION = "2.0.0-hybrid.1";
 
 function intEnv(name: string, fallback: number): number {
   const raw = process.env[name];
