@@ -20,6 +20,7 @@ import {
   listAgents,
   listModels,
   listSessions,
+  rejectForm,
   restoreChatSession,
   sendMessage,
   serverInfo,
@@ -28,6 +29,19 @@ import {
   type SessionSummary,
 } from "./opencode.ts";
 import { batteryOnce, funnelOff, funnelOn, funnelStatus } from "./workers.ts";
+import {
+  askCustom,
+  cancelTurn,
+  chooseOption,
+  consumeCustomAnswer,
+  getTurn,
+  rejectQuestions,
+  replyPermission,
+  routeEvent,
+  startTurn,
+  submitQuestions,
+  toggleOption,
+} from "./turns.ts";
 
 interface ChatCfg {
   sid?: string | null;
@@ -100,7 +114,8 @@ export function createBot(): Bot {
   bot.command("cancel", async (ctx) => {
     const sid = cfgFor(ctx.chat.id).sid;
     if (sid) await interruptSession(sid);
-    await ctx.reply("⏹ Resposta interrompida.");
+    const had = await cancelTurn(bot, ctx.chat.id);
+    await ctx.reply(had ? "⏹ Resposta interrompida." : "⏹ Nada em andamento.");
   });
 
   bot.command("status", async (ctx) => {
@@ -212,10 +227,43 @@ export function createBot(): Bot {
     await ctx.reply(r.message, { parse_mode: "Markdown" });
   });
 
-  // Permissões e forms v2 via resposta livre: "allow:<id>" / "deny:<id>".
+  // Permissões e forms v2 via botões (perm:/qo:/qt:/qs:/qr:/qc:) ou texto
+  // ("allow:<id>", "form:<id> {...}", resposta custom digitada).
+  bot.callbackQuery(/^perm:(.+):(once|always|reject)$/, async (ctx) => {
+    const m = ctx.match as RegExpMatchArray;
+    await ctx.answerCallbackQuery("respondido");
+    await replyPermission(bot, ctx.chat!.id, m[1], m[2] as "once" | "always" | "reject");
+  });
+  bot.callbackQuery(/^qo:(.+):(\d+):(\d+)$/, async (ctx) => {
+    const m = ctx.match as RegExpMatchArray;
+    await ctx.answerCallbackQuery("ok");
+    await chooseOption(bot, ctx.chat!.id, m[1], Number(m[2]), Number(m[3]));
+  });
+  bot.callbackQuery(/^qt:(.+):(\d+):(\d+)$/, async (ctx) => {
+    const m = ctx.match as RegExpMatchArray;
+    await ctx.answerCallbackQuery("alternado");
+    await toggleOption(bot, ctx.chat!.id, m[1], Number(m[2]), Number(m[3]));
+  });
+  bot.callbackQuery(/^qs:(.+)$/, async (ctx) => {
+    const m = ctx.match as RegExpMatchArray;
+    await ctx.answerCallbackQuery("enviando");
+    await submitQuestions(bot, ctx.chat!.id, m[1]);
+  });
+  bot.callbackQuery(/^qr:(.+)$/, async (ctx) => {
+    const m = ctx.match as RegExpMatchArray;
+    await ctx.answerCallbackQuery("rejeitado");
+    await rejectQuestions(bot, ctx.chat!.id, m[1], rejectForm);
+  });
+  bot.callbackQuery(/^qc:(.+):(\d+)$/, async (ctx) => {
+    const m = ctx.match as RegExpMatchArray;
+    await ctx.answerCallbackQuery();
+    await askCustom(bot, ctx.chat!.id, m[1], Number(m[2]));
+  });
+
   bot.on("message:text", async (ctx) => {
     const text = ctx.message.text.trim();
     const chatId = ctx.chat.id;
+    if (await consumeCustomAnswer(bot, chatId, text)) return;
     const m = text.match(/^(allow|deny):(\S+)\s*(once|always)?$/i);
     const sid = cfgFor(chatId).sid;
     if (m && sid) {
@@ -240,23 +288,22 @@ export function createBot(): Bot {
       return;
     }
     const cfg = cfgFor(chatId);
+    const turn = await startTurn(bot, chatId, target);
+    if (!turn) return; // já há turno rodando (startTurn avisou)
     try {
       await sendMessage(target, text, { model: cfg.model, agent: cfg.agent });
-      await ctx.reply("⏳ processando… (acompanhe pelos eventos do servidor)");
     } catch (e) {
       await ctx.reply(`❌ falha ao enviar: ${e}`.slice(0, 500));
+      const live = getTurn(chatId);
+      if (live) {
+        const { finishTurn } = await import("./turns.ts");
+        (live.state as Record<string, unknown>).out_text = `❌ Falha ao enviar para o opencode: ${e}`;
+        await finishTurn(bot, live);
+      }
     }
   });
 
   return bot;
-}
-
-function handleServerEvent(ev: ServerEvent): void {
-  // Log enxuto; o roteamento por sessão/turno vive no núcleo Python
-  // e será portado por etapas. Eventos v2: {type, data}.
-  if (ev.type.startsWith("session.") || ev.type.startsWith("form.") || ev.type.startsWith("permission.")) {
-    console.log(`[event] ${ev.type}`);
-  }
 }
 
 async function batteryWatch(bot: Bot): Promise<void> {
@@ -295,7 +342,7 @@ export async function bootstrap(): Promise<Bot> {
   await ensureServer();
   sessions = await listSessions();
   const bot = createBot();
-  void consumeEvents(handleServerEvent, () => stopSse);
+  void consumeEvents((ev) => void routeEvent(bot, ev), () => stopSse);
   void batteryWatch(bot).catch((e) => console.warn("batteryWatch saiu:", e));
   return bot;
 }

@@ -289,8 +289,16 @@ export async function answerForm(sid: string, formId: string, answer: Record<str
   }
 }
 
-export async function interruptSession(sid: string): Promise<void> {
-  if (!sid) return;
+export async function rejectForm(sid: string, formId: string): Promise<boolean> {
+  try {
+    const r = await api(`/api/session/${sid}/form/${formId}/cancel`, { method: "POST" });
+    return r.status < 400;
+  } catch {
+    return false;
+  }
+}
+
+export async function interruptSession(sid: string): Promise<void> {  if (!sid) return;
   try {
     await api(`/api/session/${sid}/interrupt`, { method: "POST" }, 10_000);
   } catch {

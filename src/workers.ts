@@ -75,3 +75,112 @@ export async function renderMarkdown(text: string): Promise<string> {
   const r = (await runPy("py/render_cli.py", { text })) as { html: string };
   return r.html;
 }
+
+// ---- turn worker (py/turn_cli.py) ----
+
+export type TurnState = Record<string, unknown>;
+
+export type FoldAction = "none" | "push" | "push_force" | "finish";
+
+export interface FoldResult {
+  turn: TurnState;
+  action: FoldAction;
+  detail: { reason?: string; error?: string } | null;
+}
+
+async function turnCall(payload: Record<string, unknown>, timeoutMs = 20_000): Promise<Record<string, unknown>> {
+  const r = (await runPy("py/turn_cli.py", payload, timeoutMs)) as Record<string, unknown>;
+  if (r.error) throw new Error(`turn_cli: ${r.error}`);
+  return r;
+}
+
+export async function turnNew(chatId: number): Promise<TurnState> {
+  const r = await turnCall({ action: "new_turn", chat_id: chatId });
+  return r.turn as TurnState;
+}
+
+export async function turnFold(turn: TurnState, event: unknown): Promise<FoldResult> {
+  const r = await turnCall({ action: "fold", turn, event });
+  return {
+    turn: r.turn as TurnState,
+    action: r.action as FoldAction,
+    detail: (r.detail as FoldResult["detail"]) ?? null,
+  };
+}
+
+export async function turnSelectOption(
+  turn: TurnState,
+  requestId: string,
+  qidx: number,
+  opt: number,
+): Promise<{ turn: TurnState; changed: boolean }> {
+  const r = await turnCall({ action: "select_option", turn, request_id: requestId, qidx, opt });
+  return { turn: r.turn as TurnState, changed: Boolean(r.changed) };
+}
+
+export async function turnSetCustom(turn: TurnState, requestId: string, qidx: number): Promise<TurnState> {
+  const r = await turnCall({ action: "set_custom", turn, request_id: requestId, qidx });
+  return r.turn as TurnState;
+}
+
+export async function turnAnswerCustom(
+  turn: TurnState,
+  requestId: string,
+  qidx: number,
+  text: string,
+): Promise<{ turn: TurnState; complete: boolean; answer: Record<string, unknown> }> {
+  const r = await turnCall({ action: "answer_custom", turn, request_id: requestId, qidx, text });
+  const res = r.res as { complete: boolean; answer: Record<string, unknown> };
+  return { turn: r.turn as TurnState, complete: res.complete, answer: res.answer };
+}
+
+export async function turnSubmitForm(
+  turn: TurnState,
+  requestId: string,
+): Promise<{ turn: TurnState; complete: boolean; answer: Record<string, unknown>; missing: number[] }> {
+  const r = await turnCall({ action: "submit_form", turn, request_id: requestId });
+  return {
+    turn: r.turn as TurnState,
+    complete: Boolean(r.complete),
+    answer: (r.answer as Record<string, unknown>) ?? {},
+    missing: (r.missing as number[]) ?? [],
+  };
+}
+
+export async function turnDropForm(turn: TurnState, requestId: string): Promise<TurnState> {
+  const r = await turnCall({ action: "drop_form", turn, request_id: requestId });
+  return r.turn as TurnState;
+}
+
+export interface TurnButton {
+  text: string;
+  data: string;
+}
+
+export async function turnRenderRunning(
+  turn: TurnState,
+  opencodeDir: string,
+): Promise<{ text: string; keyboard: TurnButton[][] }> {
+  const r = await turnCall({ action: "render_running", turn, opencode_dir: opencodeDir });
+  return { text: r.text as string, keyboard: (r.keyboard as TurnButton[][]) ?? [] };
+}
+
+export async function turnRenderThink(turn: TurnState, elapsed: number, opencodeDir: string): Promise<string> {
+  const r = await turnCall({ action: "render_think", turn, elapsed, opencode_dir: opencodeDir });
+  return r.text as string;
+}
+
+export async function turnRenderResult(turn: TurnState): Promise<string> {
+  const r = await turnCall({ action: "render_result", turn });
+  return r.text as string;
+}
+
+export async function turnSplit(text: string, limit = 3500): Promise<string[]> {
+  const r = await turnCall({ action: "split", text, limit });
+  return (r.chunks as string[]) ?? [text];
+}
+
+export async function turnTelegramHtml(text: string, maxLen = 3800): Promise<string> {
+  const r = await turnCall({ action: "telegram_html", text, max_len: maxLen });
+  return r.html as string;
+}
