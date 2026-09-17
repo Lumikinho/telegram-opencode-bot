@@ -9,8 +9,8 @@ import time
 from telegram import Update
 from telegram.error import TelegramError
 from . import state
-from .opencode import oc_answer_question, oc_create_session, oc_send_with_retry
-from .render import TOOL_ICONS, _fmt_path, _kb_after_turn, _render_running, _render_think, _result_text, _safe_edit_message, _safe_send_message, _split_text, _telegram_html
+from .opencode import oc_answer_question, oc_active_sessions, oc_create_session, oc_last_assistant_text, oc_send_with_retry
+from .render import TOOL_ICONS, _chrome_html, _diff_added_removed, _extract_urls, _fmt_path, _kb_after_turn, _render_running, _render_think, _result_text, _safe_edit_message, _safe_send_message, _split_text, _telegram_html
 
 
 logger = logging.getLogger(__name__)
@@ -148,6 +148,67 @@ def _cmd_of_part(state: dict) -> str:
     return str(cmd or "")
 
 
+def _tool_output_text(data: dict, limit: int = 2000) -> str:
+    """Extrai o retorno da ferramenta no formato do servidor v2.0.3+:
+    `content: [{type: "text", text}, ...]`; cai para os campos legados
+    (`output`/`error`/`message`) quando o servidor antigo responder."""
+    parts = []
+    content = data.get("content")
+    if isinstance(content, list):
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "text" and item.get("text"):
+                parts.append(str(item["text"]))
+            elif isinstance(item.get("text"), str) and item["text"]:
+                parts.append(str(item["text"]))
+            elif item.get("type") == "file" and item.get("path"):
+                parts.append(f"[arquivo: {item['path']}]")
+    text = "\n".join(parts).strip()
+    if not text:
+        err = data.get("error")
+        if isinstance(err, dict):
+            text = str(err.get("message") or err.get("text") or "")
+        else:
+            text = str(err or data.get("output") or data.get("message") or "")
+    return text[:limit]
+
+
+_SNAPSHOT_MAX = 100_000
+
+
+def _tool_file_path(inp: dict) -> str:
+    """Arquivo-alvo de write/edit (tolerante aos nomes de campo)."""
+    if not isinstance(inp, dict):
+        return ""
+    for key in ("filePath", "path", "file", "file_path"):
+        val = inp.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
+
+
+def _read_text_capped(path: str) -> str | None:
+    """Conteúdo atual do arquivo (None se não der para ler/decodificar)."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="strict") as fh:
+            return fh.read(_SNAPSHOT_MAX + 1)[:_SNAPSHOT_MAX + 1]
+    except (OSError, ValueError, UnicodeError):
+        return None
+
+
+def _research_query(inp: dict) -> str:
+    if not isinstance(inp, dict):
+        return ""
+    for key in ("query", "url", "urls", "question", "prompt", "text"):
+        val = inp.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()[:200]
+        if isinstance(val, list) and val and isinstance(val[0], str):
+            return val[0].strip()[:200]
+    return ""
+
+
 def _record_tool(turn: dict, part: dict):
     tool = part.get("tool")
     state = part.get("state", {})
@@ -155,12 +216,13 @@ def _record_tool(turn: dict, part: dict):
     if status not in ("running", "completed", "error"):
         return
     part_id = part.get("id")
-    path = (state.get("input") or {}).get("filePath")
+    inp = state.get("input") or {}
+    path = inp.get("filePath") or inp.get("path")
 
     if tool in ("bash", "shell"):
         cmd = _cmd_of_part(state)
         if status == "running":
-            turn["current"] = {"cmd": cmd or "comando", "out": state.get("output") or ""}
+            turn["current"] = {"tool": tool, "cmd": cmd or "comando", "out": state.get("output") or ""}
             return
         if status in ("completed", "error"):
             if part_id:
@@ -179,7 +241,7 @@ def _record_tool(turn: dict, part: dict):
 
     if tool == "read":
         if status == "running":
-            turn["current"] = {"label": f"📖 lendo `{_fmt_path(path)}`" if path else "📖 lendo arquivo", "out": ""}
+            turn["current"] = {"tool": tool, "label": f"📖 lendo `{_fmt_path(path)}`" if path else "📖 lendo arquivo", "out": ""}
         elif status in ("completed", "error") and path:
             turn["reads"].add(path)
             turn["current"] = None
@@ -187,7 +249,7 @@ def _record_tool(turn: dict, part: dict):
             turn["current"] = None
     elif tool == "write":
         if status == "running":
-            turn["current"] = {"label": f"➕ criando `{_fmt_path(path)}`" if path else "➕ criando arquivo", "out": ""}
+            turn["current"] = {"tool": tool, "label": f"➕ criando `{_fmt_path(path)}`" if path else "➕ criando arquivo", "out": ""}
         elif status in ("completed", "error") and path:
             turn["writes"].add(path)
             turn["current"] = None
@@ -195,7 +257,7 @@ def _record_tool(turn: dict, part: dict):
             turn["current"] = None
     elif tool == "edit":
         if status == "running":
-            turn["current"] = {"label": f"✏️ editando `{_fmt_path(path)}`" if path else "✏️ editando arquivo", "out": ""}
+            turn["current"] = {"tool": tool, "label": f"✏️ editando `{_fmt_path(path)}`" if path else "✏️ editando arquivo", "out": ""}
         elif status in ("completed", "error") and path:
             turn["edits"].add(path)
             turn["current"] = None
@@ -207,7 +269,7 @@ def _record_tool(turn: dict, part: dict):
         if status == "error" and "permission" in (state.get("error") or "").lower():
             turn["rejected"] += 1
             label = "❌ permissão negada"
-        turn["current"] = {"label": label, "out": ""} if status == "running" else None
+        turn["current"] = {"tool": tool, "label": label, "out": ""} if status == "running" else None
 
 
 def _new_turn_skeleton(chat_id: int) -> dict:
@@ -234,6 +296,8 @@ def _new_turn_skeleton(chat_id: int) -> dict:
         "process_seen": set(),
         "current": None,
         "out_text": "",
+        "reasoning_text": "",
+        "reasoning_active": False,
         "reasoning_part_ids": set(),
         "user_msg_id": None,
         "streamed_len": 0,
@@ -244,7 +308,49 @@ def _new_turn_skeleton(chat_id: int) -> dict:
         "typing_task": None,
         "stream_task": None,
         "tool_names": {},
+        "research": [],
+        "filediffs": {},
+        "attached": False,
+        "_file_before": {},
     }
+
+
+async def attach_turn(chat_id: int, sid: str) -> bool:
+    """Anexa o chat a uma sessão que já está em andamento no servidor
+    (ex.: o usuário trocou para ela via /sessions enquanto outro cliente
+    a executa).
+
+    Cria o turno local para que deltas, ferramentas, permissões e a
+    resposta final fluam ao vivo no Telegram. Retorna True se anexou.
+    Não anexa se o chat já tem turno ativo ou a sessão não está rodando."""
+    if not sid or chat_id in state.TURNS:
+        return False
+    try:
+        active = await oc_active_sessions()
+    except Exception:
+        return False
+    if sid not in active:
+        return False
+    turn = _new_turn_skeleton(chat_id)
+    turn["sid"] = sid
+    turn["attached"] = True
+    state.TURNS[chat_id] = turn
+    app = state._app_ref
+    try:
+        msg = await _safe_send_message(
+            app.bot, chat_id,
+            "🔌 *Conectado à sessão em andamento…* acompanho ao vivo.",
+            parse_mode="Markdown",
+        )
+        if msg is not None:
+            turn["status_msg_id"] = msg.message_id
+    except Exception as e:
+        logger.debug("Falha ao avisar anexo à sessão: %s", e)
+    turn["started"] = time.monotonic()
+    _start_typing(turn)
+    turn["stream_task"] = asyncio.create_task(_stream_loop(turn))
+    logger.info("Chat %s anexado à sessão em andamento %s", chat_id, (sid or "")[-6:])
+    return True
 
 
 async def _start_turn(update_or_chat, text: str, parts: list | None = None):
@@ -269,7 +375,7 @@ async def _start_turn(update_or_chat, text: str, parts: list | None = None):
             chat_cfg["sid"] = sid
         turn["sid"] = sid
 
-        placeholder = await update_or_chat.message.reply_text("💭 *opencode pensando…*", parse_mode="Markdown")
+        placeholder = await update_or_chat.message.reply_text(_chrome_html("💭 *opencode pensando…*"), parse_mode="HTML")
         turn["status_msg_id"] = placeholder.message_id
         turn["started"] = time.monotonic()
 
@@ -308,6 +414,13 @@ async def _finish_turn(chat_id: int):
     app = state._app_ref
     # ---- inverted order: answer on top, think below ----
     answer = (turn["out_text"] or "").strip()
+    if not answer and turn.get("attached"):
+        # Anexamos no meio da execução e não capturamos deltas suficientes:
+        # busca a resposta persistida em vez de entregar "(sem resposta)".
+        try:
+            answer = (await oc_last_assistant_text(turn.get("sid") or "")).strip()
+        except Exception as e:
+            logger.debug("Falha no backfill da resposta: %s", e)
     if not answer:
         answer = "(sem resposta)"
     bodies = [_telegram_html(c, max_len=3500) for c in _split_text(answer, limit=3500)]
@@ -488,28 +601,106 @@ async def _dispatch(event: dict):
         await _finish_turn(turn["chat_id"])
     elif et == "session.text.delta":
         turn["out_text"] += data.get("delta", "")
+    elif et == "session.text.ended":
+        full = data.get("text")
+        if isinstance(full, str) and len(full) >= len(turn.get("out_text") or ""):
+            turn["out_text"] = full
+    elif et == "session.reasoning.started":
+        turn["reasoning_active"] = True
     elif et == "session.reasoning.delta":
+        turn["reasoning_text"] = (turn.get("reasoning_text") or "") + str(data.get("delta", ""))
+    elif et == "session.reasoning.ended":
+        full = data.get("text")
+        if isinstance(full, str) and full:
+            turn["reasoning_text"] = full
+        turn["reasoning_active"] = False
+    elif et == "session.tool.input.started":
+        # Servidor v2.0.3+: o nome da ferramenta vem aqui
+        # (o `session.tool.called` não traz mais `name`).
+        tid = data.get("id") or ""
+        if tid and data.get("name"):
+            entry = turn["tool_names"].get(tid) or {}
+            entry["name"] = data["name"]
+            turn["tool_names"][tid] = entry
+    elif et == "session.tool.input.delta":
         pass
+    elif et == "session.tool.input.ended":
+        # O input completo vem aqui como JSON em `text`.
+        tid = data.get("id") or ""
+        if tid:
+            entry = turn["tool_names"].get(tid) or {}
+            try:
+                parsed = json.loads(data.get("text") or "")
+                if isinstance(parsed, dict):
+                    entry["input"] = parsed
+            except ValueError:
+                pass
+            turn["tool_names"][tid] = entry
     elif et == "session.tool.called":
-        name = data.get("name") or "ferramenta"
-        if data.get("id"):
-            turn["tool_names"][data["id"]] = {"name": name, "input": data.get("input") or {}}
+        seen = turn["tool_names"].get(data.get("id") or "") or {}
+        name = data.get("name") or seen.get("name") or "ferramenta"
+        inp = data.get("input") or seen.get("input") or {}
+        tid = data.get("id") or ""
+        if tid:
+            turn["tool_names"][tid] = {"name": name, "input": inp}
+            if name in ("write", "edit"):
+                path = _tool_file_path(inp)
+                if path:
+                    turn["_file_before"][tid] = {"path": path, "text": _read_text_capped(path)}
+            elif name.startswith("web"):
+                turn["research"].append({"id": tid, "tool": name, "query": _research_query(inp),
+                                         "sites": [], "status": "running"})
         _record_tool(turn, {
             "tool": name,
             "id": data.get("id"),
-            "state": {"status": "running", "input": data.get("input") or {}},
+            "state": {"status": "running", "input": inp},
         })
         await _push_status(turn)
     elif et in ("session.tool.success", "session.tool.failed"):
         seen = turn["tool_names"].pop(data.get("id") or "", None) or {}
-        name = seen.get("name") or "ferramenta"
+        name = seen.get("name") or data.get("name") or "ferramenta"
         status = "completed" if et == "session.tool.success" else "error"
-        if status == "error" and "permission" in str(data.get("error") or "").lower():
+        err = data.get("error")
+        err_text = (err.get("message") if isinstance(err, dict) else err) or ""
+        if status == "error" and "permission" in str(err_text or data.get("message") or "").lower():
             turn["rejected"] += 1
+        output = _tool_output_text(data)
+        tid = data.get("id") or ""
+        if name in ("write", "edit"):
+            before = turn["_file_before"].pop(tid, None) or {}
+            path = before.get("path") or _tool_file_path(seen.get("input") or {})
+            if path:
+                added, removed = _diff_added_removed(before.get("text"), _read_text_capped(path))
+                prev = turn["filediffs"].get(path) or {"added": [], "removed": []}
+                prev["added"] = ((prev.get("added") or []) + added)[:30]
+                prev["removed"] = ((prev.get("removed") or []) + removed)[:30]
+                if not prev["added"] and not prev["removed"] and not prev.get("note"):
+                    prev["note"] = output[:200] or "sem alterações detectadas"
+                turn["filediffs"][path] = prev
+        elif name.startswith("web"):
+            for r in turn["research"]:
+                if tid and r.get("id") != tid:
+                    continue
+                if r.get("status") != "running":
+                    continue
+                r["status"] = status
+                if not r.get("query"):
+                    r["query"] = _research_query(seen.get("input") or {})
+                sites = list(r.get("sites") or [])
+                query = r.get("query") or ""
+                if query.startswith("http") and query not in sites:
+                    sites.append(query[:120])
+                for u in _extract_urls(output):
+                    if u not in sites:
+                        sites.append(u)
+                r["sites"] = sites[:8]
+                break
         _record_tool(turn, {
             "tool": name,
             "id": data.get("id"),
-            "state": {"status": status, "input": seen.get("input") or {}, "output": ""},
+            "state": {"status": status, "input": seen.get("input") or {},
+                      "output": output,
+                      "error": str(err_text or "")},
         })
         await _push_status(turn)
     elif et == "session.tool.progress":
@@ -659,9 +850,11 @@ async def _consume_custom_answer(update: Update, text: str) -> bool:
     item["answer"] = [text]
     ok = await _submit_question(turn, rid)
     await update.message.reply_text(
-        "✅ *Resposta enviada ao opencode.*" if ok else
-        "❌ *Falha ao enviar resposta ao opencode.*",
-        parse_mode="Markdown",
+        _chrome_html(
+            "✅ *Resposta enviada ao opencode.*" if ok else
+            "❌ *Falha ao enviar resposta ao opencode.*"
+        ),
+        parse_mode="HTML",
     )
     await _refresh_after_question(turn)
     return True

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { authHeader, pickSessionId } from "../src/opencode.ts";
+import { authHeader, HEALTH_PATHS, pickSessionId } from "../src/opencode.ts";
 
 describe("v2 auth header", () => {
   test("monta Basic opencode:<senha>", () => {
@@ -11,8 +11,7 @@ describe("v2 auth header", () => {
   });
 });
 
-describe("pickSessionId", () => {
-  test("mantém sid guardado quando existe", () => {
+describe("pickSessionId", () => {  test("mantém sid guardado quando existe", () => {
     const sessions = [{ id: "a" }, { id: "b" }];
     expect(pickSessionId("b", sessions)).toBe("b");
   });
@@ -25,5 +24,11 @@ describe("pickSessionId", () => {
   });
   test("null sem sessões", () => {
     expect(pickSessionId("x", [])).toBeNull();
+  });
+});
+
+describe("HEALTH_PATHS", () => {
+  test("cascata V2 → legado V1 → info, nessa ordem", () => {
+    expect([...HEALTH_PATHS]).toEqual(["/api/health", "/global/health", "/api/status"]);
   });
 });

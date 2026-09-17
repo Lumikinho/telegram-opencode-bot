@@ -9,6 +9,12 @@ import { OC_PASSWORD, OC_PORT, OC_URL, OPENCODE_DIR } from "./config.ts";
 
 export const endpoint = { port: OC_PORT, url: OC_URL };
 
+/** Cascata de readiness (verificada no fonte do servidor):
+ * `/api/health` (V2) → `/global/health` (legado/V1) → `/api/status` (info).
+ * Sem o meio-termo, um servidor V1 ativo levava 404 duplo e o bot
+ * spawnava um segundo servidor à toa. */
+export const HEALTH_PATHS = ["/api/health", "/global/health", "/api/status"] as const;
+
 /** Relê porta/URL do `.env` em disco (sem tocar no process.env), para que
  * o /restart respeite uma mudança de porta feita no arquivo. */
 export async function refreshEndpointFromEnv(): Promise<{ port: number; url: string }> {
@@ -59,12 +65,17 @@ async function api(
 }
 
 export async function serverOk(): Promise<boolean> {
-  try {
-    const r = await api("/api/status", {}, 7_000);
-    return r.status === 200;
-  } catch {
-    return false;
+  // Cascata HEALTH_PATHS: 200 vence; 404 tenta a próxima; resto falha fechado.
+  for (const path of HEALTH_PATHS) {
+    try {
+      const r = await api(path, {}, 7_000);
+      if (r.status === 200) return true;
+      if (r.status !== 404) return false;
+    } catch {
+      return false;
+    }
   }
+  return false;
 }
 
 export interface ServerInfo {
@@ -88,26 +99,37 @@ export async function serverInfo(): Promise<ServerInfo> {
     error: null,
   };
   const t0 = Date.now();
-  try {
-    const r = await api("/api/status", {}, 7_000);
-    info.latencyMs = Date.now() - t0;
-    if (r.status === 200) {
-      info.ok = true;
-      info.status = "ativo";
-      try {
-        const body = (await r.json()) as { version?: string | null };
-        info.version = body?.version ?? null;
-      } catch {
-        /* sem versão */
+  let lastError: string | null = null;
+  for (const path of HEALTH_PATHS) {
+    try {
+      const r = await api(path, {}, 7_000);
+      info.latencyMs = Date.now() - t0;
+      if (r.status === 200) {
+        info.ok = true;
+        info.status = "ativo";
+        try {
+          const body = (await r.json()) as { version?: string | null };
+          info.version = body?.version ?? null;
+        } catch {
+          /* sem versão */
+        }
+        return info;
+      } else if (r.status === 401) {
+        info.error = "HTTP 401: senha do servidor (OPENCODE_SERVER_PASSWORD) incorreta";
+        return info;
+      } else if (r.status === 404) {
+        lastError = `HTTP 404 em ${path}`;
+        continue;
+      } else {
+        info.error = `HTTP ${r.status}`;
+        return info;
       }
-    } else if (r.status === 401) {
-      info.error = "HTTP 401: senha do servidor (OPENCODE_SERVER_PASSWORD) incorreta";
-    } else {
-      info.error = `HTTP ${r.status}`;
+    } catch (e) {
+      info.error = `${e}`.slice(0, 200);
+      return info;
     }
-  } catch (e) {
-    info.error = `${e}`.slice(0, 200);
   }
+  info.error = lastError;
   return info;
 }
 
@@ -204,7 +226,9 @@ export async function createSession(): Promise<string> {
 
 export async function listSessions(): Promise<SessionSummary[]> {
   try {
-    const r = await api("/api/session", {}, 30_000);
+    // Explícito: cauda newest-first (o default do servidor já é esse, mas
+    // depender de default silencioso quebra sem aviso).
+    const r = await api("/api/session?limit=50&order=desc", {}, 30_000);
     if (!r.ok) return [];
     const data = ((await r.json()) as { data?: unknown })?.data;
     return Array.isArray(data) ? (data as SessionSummary[]) : [];

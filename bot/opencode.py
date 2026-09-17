@@ -24,6 +24,13 @@ from . import config, state
 logger = logging.getLogger(__name__)
 
 
+# Cascata de readiness (verificada no fonte do servidor):
+# /api/health (V2) → /global/health (legado/V1) → /api/status (info).
+# Sem o meio-termo, um servidor V1 ativo levava 404 duplo e o bot
+# spawnava um segundo servidor à toa.
+HEALTH_PATHS = ("/api/health", "/global/health", "/api/status")
+
+
 def _effective_password() -> str:
     """Senha vigente: configurada no env ou gerada no spawn desta execução."""
     return config.OC_PASSWORD or getattr(state, "_server_password", "") or ""
@@ -46,11 +53,17 @@ def _build_client() -> httpx.AsyncClient:
 
 
 async def oc_server_ok() -> bool:
-    try:
-        r = await asyncio.wait_for(state._client.get("/api/status"), timeout=7.0)
-        return r.status_code == 200
-    except Exception:
-        return False
+    # Cascata HEALTH_PATHS: 200 vence; 404 tenta a próxima; resto falha fechado.
+    for path in HEALTH_PATHS:
+        try:
+            r = await asyncio.wait_for(state._client.get(path), timeout=7.0)
+            if r.status_code == 200:
+                return True
+            if r.status_code != 404:
+                return False
+        except Exception:
+            return False
+    return False
 
 
 async def oc_server_info() -> dict:
@@ -73,22 +86,32 @@ async def oc_server_info() -> dict:
         info["error"] = "cliente HTTP não inicializado"
         return info
     t0 = time.monotonic()
-    try:
-        r = await asyncio.wait_for(state._client.get("/api/status"), timeout=7.0)
-        info["latency_ms"] = int((time.monotonic() - t0) * 1000)
-        if r.status_code == 200:
-            info["ok"] = True
-            info["status"] = "ativo"
-            try:
-                info["version"] = (r.json() or {}).get("version")
-            except Exception:
-                pass
-        elif r.status_code == 401:
-            info["error"] = "HTTP 401: senha do servidor (OPENCODE_SERVER_PASSWORD) incorreta"
-        else:
-            info["error"] = f"HTTP {r.status_code}"
-    except Exception as e:
-        info["error"] = f"{type(e).__name__}: {e}".strip()[:200]
+    last_error: str | None = None
+    for path in HEALTH_PATHS:
+        try:
+            r = await asyncio.wait_for(state._client.get(path), timeout=7.0)
+            info["latency_ms"] = int((time.monotonic() - t0) * 1000)
+            if r.status_code == 200:
+                info["ok"] = True
+                info["status"] = "ativo"
+                try:
+                    info["version"] = (r.json() or {}).get("version")
+                except Exception:
+                    pass
+                return info
+            elif r.status_code == 401:
+                info["error"] = "HTTP 401: senha do servidor (OPENCODE_SERVER_PASSWORD) incorreta"
+                return info
+            elif r.status_code == 404:
+                last_error = f"HTTP 404 em {path}"
+                continue
+            else:
+                info["error"] = f"HTTP {r.status_code}"
+                return info
+        except Exception as e:
+            info["error"] = f"{type(e).__name__}: {e}".strip()[:200]
+            return info
+    info["error"] = last_error
     return info
 
 
@@ -215,15 +238,83 @@ async def oc_create_session() -> str:
 
 
 async def oc_list_sessions() -> list[dict]:
-    """Lista as sessões do servidor (vazia se falhar)."""
+    """Lista as sessões do servidor (vazia se falhar). Cauda newest-first explícita."""
     try:
-        r = await state._client.get("/api/session")
+        r = await state._client.get("/api/session", params={"limit": 50, "order": "desc"})
         r.raise_for_status()
         data = (r.json() or {}).get("data")
         return data if isinstance(data, list) else []
     except Exception as e:
         logger.warning("Falha ao listar sessões: %s", e)
         return []
+
+
+async def oc_active_sessions() -> dict[str, str]:
+    """Sessões em execução agora: {sid: kind} via `GET /api/session/active`.
+
+    Vazio se falhar — quem chama trata como "nada em andamento"."""
+    try:
+        r = await state._client.get("/api/session/active")
+        r.raise_for_status()
+        data = (r.json() or {}).get("data") or {}
+        if not isinstance(data, dict):
+            return {}
+        out = {}
+        for sid, v in data.items():
+            if isinstance(v, dict):
+                out[sid] = str(v.get("type") or "")
+            elif v:
+                out[sid] = str(v)
+        return out
+    except Exception as e:
+        logger.warning("Falha ao listar sessões ativas: %s", e)
+        return {}
+
+
+def latest_assistant_text(messages: list, limit: int = 3500) -> str:
+    """Primeiro texto de assistant numa página **desc** (mais nova primeiro).
+
+    Pura e testável. A página vem com `?limit=&order=desc`, então o primeiro
+    hit já é o mais recente — sem baixar o histórico inteiro."""
+    for m in messages or []:
+        if not isinstance(m, dict) or m.get("type") != "assistant":
+            continue
+        texts = [
+            p.get("text") for p in (m.get("content") or [])
+            if isinstance(p, dict) and p.get("type") == "text" and (p.get("text") or "").strip()
+        ]
+        if texts:
+            return "\n".join(texts).strip()[:limit]
+    return ""
+
+
+async def oc_last_assistant_text(sid: str, limit: int = 3500) -> str:
+    """Último texto do assistente persistido na sessão.
+
+    Backfill para quando o bot anexa a uma sessão já em andamento e o
+    turno local termina sem ter capturado deltas suficientes. Lê só a
+    cauda (`limit`/`order=desc`), não a conversa inteira."""
+    try:
+        r = await state._client.get(
+            f"/api/session/{sid}/message", params={"limit": 50, "order": "desc"}
+        )
+        r.raise_for_status()
+        return latest_assistant_text((r.json() or {}).get("data") or [], limit)
+    except Exception as e:
+        logger.warning("Falha ao ler mensagens da sessão %s: %s", (sid or "")[-6:], e)
+    return ""
+
+
+async def oc_get_session(sid: str) -> dict:
+    """Detalhe de uma sessão (título, modelo, tokens, diretório) ou {}."""
+    try:
+        r = await state._client.get(f"/api/session/{sid}")
+        r.raise_for_status()
+        data = (r.json() or {}).get("data")
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        logger.warning("Falha ao ler sessão %s: %s", (sid or "")[-6:], e)
+        return {}
 
 
 def pick_session_id(stored_sid: str | None, sessions: list[dict]) -> str | None:

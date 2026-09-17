@@ -1,6 +1,5 @@
 """Comandos do bot (/new, /status, /restart, /bateria, ...)."""
 import asyncio
-import json
 import logging
 import re
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -12,10 +11,10 @@ from ..battery import _BAT_STATUS_PT, format_bateria, read_battery
 from ..funnel import funnel_off, funnel_on, get_funnel_status, parse_active_funnels
 from ..mcp_cfg import _mcp_file, _mcp_remove_server, _mcp_set_server, _mcp_url
 from ..opencode import _run_cli, _strip_ansi, oc_create_session, oc_ensure_server, oc_list_agents, oc_list_models, oc_server_info
-from ..render import _kb_menu, _kb_menu_server, _kb_quick, _kb_restart, _kb_status, _menu_main_text, _models_kb, _reply_or_edit, _safe_send_message
+from ..render import _chrome_html, _kb_menu, _kb_menu_server, _kb_quick, _kb_restart, _kb_status, _menu_main_text, _models_head, _models_kb, _models_pages, _reply_or_edit, _safe_send_message
 from ..render import _RESTART_ALIASES
 from ..restart import _perform_restart
-from ..turns import _finish_turn, oc_abort
+from ..turns import _finish_turn, attach_turn, oc_abort
 
 
 logger = logging.getLogger(__name__)
@@ -27,9 +26,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     info = await oc_server_info()
     await update.message.reply_text(
-        _menu_main_text(info["ok"], info["latency_ms"]) + "\n\n"
-        "Envie qualquer mensagem e eu respondo com o opencode.",
-        parse_mode="Markdown",
+        _chrome_html(
+            _menu_main_text(info["ok"], info["latency_ms"]) + "\n\n"
+            "Envie qualquer mensagem e eu respondo com o opencode."
+        ),
+        parse_mode="HTML",
         reply_markup=_kb_menu(info["ok"]),
     )
 
@@ -53,7 +54,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reject_unauthorized(update, context)
         return
     await update.message.reply_text(
-        "*Comandos do opencode:*\n\n"
+        _chrome_html(
+            "*Comandos do opencode:*\n\n"
         "Envie fotos, áudios, vídeos e arquivos junto com um texto (às vezes a legenda).\n\n"
         "  /models — lista modelos; `/models opencode/xx` define\n"
         "  /agents — lista agentes; `/agents <nome>` define\n"
@@ -70,7 +72,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  /restart [bot|servidor|ambos] — reinicia o bot, o servidor ou os dois (respostas em andamento são interrompidas)\n"
         "  /menu — painel interativo com botões (Status / Opencode / Servidor)\n"
         "  /help — esta ajuda (alias /ajuda)",
-        parse_mode="Markdown",
+        ),
+        parse_mode="HTML",
         reply_markup=_kb_quick(),
     )
 
@@ -84,21 +87,21 @@ async def cmd_models(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args:
         spec = context.args[0]
         if "/" not in spec:
-            await update.message.reply_text("Formato: `/models opencode/nome`", parse_mode="Markdown")
+            await update.message.reply_text(_chrome_html("Formato: `/models opencode/nome`"), parse_mode="HTML")
             return
         providerID, modelID = spec.rsplit("/", 1)
         chat_cfg["model"] = {"providerID": providerID, "modelID": modelID}
-        await update.message.reply_text(f"✅ Modelo definido: `{providerID}/{modelID}`", parse_mode="Markdown")
+        await update.message.reply_text(_chrome_html(f"✅ Modelo definido: `{providerID}/{modelID}`"), parse_mode="HTML")
         return
     out = await oc_list_models()
     models = [m for m in out if "/" in m]
     cur = chat_cfg.get("model")
-    head = f"*Modelo atual:* `{(cur['providerID'] + '/' + cur['modelID']) if cur else 'à definir'}`\n\nEscolha o modelo:"
     if not models:
-        await update.message.reply_text("Nenhum modelo listado pelo servidor.", parse_mode="Markdown")
+        await update.message.reply_text(_chrome_html("Nenhum modelo listado pelo servidor."))
         return
-    kb = InlineKeyboardMarkup(_models_kb(models))
-    await update.message.reply_text(head, parse_mode="Markdown", reply_markup=kb)
+    total = _models_pages(len(models))
+    kb = InlineKeyboardMarkup(_models_kb(models, page=0))
+    await update.message.reply_text(_chrome_html(_models_head(cur, 0, total)), parse_mode="HTML", reply_markup=kb)
 
 
 async def cmd_agents(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -110,14 +113,14 @@ async def cmd_agents(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args:
         name = context.args[0]
         chat_cfg["agent"] = name
-        await update.message.reply_text(f"✅ Agente definido: `{name}`", parse_mode="Markdown")
+        await update.message.reply_text(_chrome_html(f"✅ Agente definido: `{name}`"), parse_mode="HTML")
         return
     out = await oc_list_agents()
     names = [n for n in out if re.match(r"^[A-Za-z0-9_.\-]+$", n or "")]
     cur = chat_cfg.get("agent")
     text = f"*Agente atual:* `{cur or 'à definir'}`\n\n"
     text += "Disponíveis:\n" + "\n".join(f"`{n}`" for n in names) if names else "❌ nenhum listado"
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text(_chrome_html(text), parse_mode="HTML")
 
 
 async def cmd_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -141,7 +144,9 @@ async def cmd_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Sessão não encontrada.")
             return
         chat_cfg["sid"] = found["id"]
-        await update.message.reply_text(f"🔁 Conversa retomada: *{found.get('title') or 'sem título'}* (`{found['id'][-6:]}`)", parse_mode="Markdown")
+        if await attach_turn(chat_id, found["id"]):
+            return
+        await update.message.reply_text(_chrome_html(f"🔁 Conversa retomada: *{found.get('title') or 'sem título'}* (`{found['id'][-6:]}`)"), parse_mode="HTML")
         return
     try:
         all_sessions = await state._client.get("/api/session")
@@ -185,7 +190,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reject_unauthorized(update, context)
         return
     out = await _run_cli("stats", timeout=40)
-    await update.message.reply_text(f"```\n{out[:3500]}\n```" if out.strip() else "❌ sem dados")
+    await update.message.reply_text(_chrome_html(f"```\n{out[:3500]}\n```" if out.strip() else "❌ sem dados"), parse_mode="HTML")
 
 
 async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -194,8 +199,8 @@ async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     v = await _run_cli("--version", timeout=20)
     await update.message.reply_text(
-        f"*opencode bot* `v{config.VERSION}`\n*opencode cli* `{v}`",
-        parse_mode="Markdown",
+        _chrome_html(f"*opencode bot* `v{config.VERSION}`\n*opencode cli* `{v}`"),
+        parse_mode="HTML",
     )
 
 
@@ -208,12 +213,12 @@ async def cmd_mcp(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if sub in ("list",):
         out = _strip_ansi(await _run_cli("mcp", "list", timeout=30))
-        await update.message.reply_text(f"```\n{out[:3500]}\n```" if out.strip() else "❌ sem saída", parse_mode="Markdown")
+        await update.message.reply_text(_chrome_html(f"```\n{out[:3500]}\n```" if out.strip() else "❌ sem saída"), parse_mode="HTML")
         return
 
     if sub == "add":
         if len(args) < 2:
-            await update.message.reply_text("Uso: `/mcp add <nome> [--url <url>]`", parse_mode="Markdown")
+            await update.message.reply_text(_chrome_html("Uso: `/mcp add <nome> [--url <url>]`"), parse_mode="HTML")
             return
         name = args[1]
         url = _mcp_url(name)
@@ -223,22 +228,24 @@ async def cmd_mcp(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if i + 1 < len(rest):
                 url = rest[i + 1]
         msg = await _mcp_set_server(name, url)
-        await update.message.reply_text(msg, parse_mode="Markdown")
+        await update.message.reply_text(_chrome_html(msg), parse_mode="HTML")
         return
 
     if sub == "token":
         if len(args) < 3:
             await update.message.reply_text(
-                "Uso: `/mcp token <nome> <TOKEN>`\n\n"
-                "Grava o header `Authorization: Bearer <TOKEN>` no servidor MCP. Para o Todoist, pegue seu API token em Todoist → Settings → Integrations → Developer.\n\n"
-                "⚠️ O token passa pelo Telegram (fica no backend deles mesmo depois que você apaga a mensagem). "
-                "Alternativa mais segura: edite `~/.config/opencode/opencode.jsonc` direto no servidor e `chmod 600` no arquivo.",
-                parse_mode="Markdown",
+                _chrome_html(
+                    "Uso: `/mcp token <nome> <TOKEN>`\n\n"
+                    "Grava o header `Authorization: Bearer <TOKEN>` no servidor MCP. Para o Todoist, pegue seu API token em Todoist → Settings → Integrations → Developer.\n\n"
+                    "⚠️ O token passa pelo Telegram (fica no backend deles mesmo depois que você apaga a mensagem). "
+                    "Alternativa mais segura: edite `~/.config/opencode/opencode.jsonc` direto no servidor e `chmod 600` no arquivo."
+                ),
+                parse_mode="HTML",
             )
             return
         name, token = args[1], args[2]
         msg = await _mcp_set_server(name, _mcp_url(name), headers={"Authorization": f"Bearer {token}"})
-        await update.message.reply_text(msg + "\n\n_(o token fica salvo em ~/.config/opencode/opencode.jsonc)_", parse_mode="Markdown")
+        await update.message.reply_text(_chrome_html(msg + "\n\n_(o token fica salvo em ~/.config/opencode/opencode.jsonc)_"), parse_mode="HTML")
         try:
             await update.message.delete()
         except Exception:
@@ -247,38 +254,38 @@ async def cmd_mcp(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if sub == "auth":
         await update.message.reply_text(
-            "⚠️ OAuth de MCP pelo bot não existe no servidor v2 — gerencie integrações pelo `opencode` local ou pela web UI.",
-            parse_mode="Markdown",
+            _chrome_html("⚠️ OAuth de MCP pelo bot não existe no servidor v2 — gerencie integrações pelo `opencode` local ou pela web UI."),
+            parse_mode="HTML",
         )
         return
 
     if sub in ("callback", "code"):
         await update.message.reply_text(
-            "⚠️ OAuth de MCP pelo bot não existe no servidor v2.",
-            parse_mode="Markdown",
+            _chrome_html("⚠️ OAuth de MCP pelo bot não existe no servidor v2."),
+            parse_mode="HTML",
         )
         return
 
     if sub in ("logout", "signout"):
         await update.message.reply_text(
-            "⚠️ OAuth de MCP pelo bot não existe no servidor v2.",
-            parse_mode="Markdown",
+            _chrome_html("⚠️ OAuth de MCP pelo bot não existe no servidor v2."),
+            parse_mode="HTML",
         )
         return
 
     if sub in ("remove", "rm", "del"):
         if len(args) < 2:
-            await update.message.reply_text("Uso: `/mcp remove <nome>`", parse_mode="Markdown")
+            await update.message.reply_text(_chrome_html("Uso: `/mcp remove <nome>`"), parse_mode="HTML")
             return
         p = _mcp_file()
         raw = p.read_text() if p.exists() else ""
         msg = await _mcp_remove_server(args[1], raw)
-        await update.message.reply_text(msg, parse_mode="Markdown")
+        await update.message.reply_text(_chrome_html(msg), parse_mode="HTML")
         return
 
     if sub in ("connect", "disconnect"):
         if len(args) < 2:
-            await update.message.reply_text(f"Uso: `/mcp {sub} <nome>`", parse_mode="Markdown")
+            await update.message.reply_text(_chrome_html(f"Uso: `/mcp {sub} <nome>`"), parse_mode="HTML")
             return
         try:
             await state._client.post(f"/api/mcp/{args[1]}/{sub}")
@@ -288,16 +295,18 @@ async def cmd_mcp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        "Subcomandos de `/mcp`:\n"
-        "  `/mcp` — lista servidores\n"
-        "  `/mcp add <nome> --url <url>` — adiciona remoto\n"
-        "  `/mcp token <nome> <TOKEN>` — define token Bearer\n"
-        "  `/mcp remove <nome>` — remove servidor\n"
-        "  `/mcp auth <nome>` — inicia OAuth\n"
-        "  `/mcp callback <nome> <código>` — conclui OAuth\n"
-        "  `/mcp logout <nome>` — remove credenciais\n"
-        "  `/mcp connect|disconnect <nome>`",
-        parse_mode="Markdown",
+        _chrome_html(
+            "Subcomandos de `/mcp`:\n"
+            "  `/mcp` — lista servidores\n"
+            "  `/mcp add <nome> --url <url>` — adiciona remoto\n"
+            "  `/mcp token <nome> <TOKEN>` — define token Bearer\n"
+            "  `/mcp remove <nome>` — remove servidor\n"
+            "  `/mcp auth <nome>` — inicia OAuth\n"
+            "  `/mcp callback <nome> <código>` — conclui OAuth\n"
+            "  `/mcp logout <nome>` — remove credenciais\n"
+            "  `/mcp connect|disconnect <nome>`"
+        ),
+        parse_mode="HTML",
     )
 
 
@@ -308,7 +317,7 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     sid = await oc_create_session()
     context.bot_data.setdefault("chats", {}).setdefault(chat_id, {})["sid"] = sid
-    await update.message.reply_text(f"🔄 *Nova conversa iniciada* (sessão `{sid[-6:]}`).", parse_mode="Markdown")
+    await update.message.reply_text(_chrome_html(f"🔄 *Nova conversa iniciada* (sessão `{sid[-6:]}`)."), parse_mode="HTML")
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -416,16 +425,18 @@ async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target = _RESTART_ALIASES.get(context.args[0].lower())
         if target is None:
             await update.message.reply_text(
-                "Uso: `/restart` ou `/restart bot|servidor|ambos`",
-                parse_mode="Markdown",
+                _chrome_html("Uso: `/restart` ou `/restart bot|servidor|ambos`"),
+                parse_mode="HTML",
             )
             return
         await _perform_restart(update.effective_chat.id, target)
         return
     await update.message.reply_text(
-        "⚠️ *Reiniciar o quê?*\n\n"
-        "Respostas em andamento serão interrompidas.",
-        parse_mode="Markdown",
+        _chrome_html(
+            "⚠️ *Reiniciar o quê?*\n\n"
+            "Respostas em andamento serão interrompidas."
+        ),
+        parse_mode="HTML",
         reply_markup=_kb_restart(),
     )
 
@@ -498,8 +509,8 @@ async def cb_funnel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         return
     try:
-        await query.message.edit_text(("✅ " if ok else "⚠️ ") + msg,
-                                      parse_mode="Markdown")
+        await query.message.edit_text(_chrome_html(("✅ " if ok else "⚠️ ") + msg),
+                                      parse_mode="HTML")
     except TelegramError:
-        await query.message.reply_text(("✅ " if ok else "⚠️ ") + msg,
-                                       parse_mode="Markdown")
+        await query.message.reply_text(_chrome_html(("✅ " if ok else "⚠️ ") + msg),
+                                       parse_mode="HTML")

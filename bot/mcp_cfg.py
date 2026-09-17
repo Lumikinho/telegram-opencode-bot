@@ -3,7 +3,6 @@ from pathlib import Path
 import json
 import logging
 import os
-from . import state
 from .opencode import oc_mcp_remove, oc_mcp_set
 
 
