@@ -31,19 +31,72 @@ import sys
 import time
 from pathlib import Path
 
-TOOL_ICONS = {
-    "read": "[READ]",
-    "write": "[ADD]",
-    "edit": "[EDIT]",
-    "bash": "»",
-    "shell": "»",
-    "glob": "[FIND]",
-    "grep": "[FIND]",
-    "mcp": "[BOT]",
-    "todo": "[TODO]",
+STREAM_MIN = 150
+
+
+# Nome da ferramenta -> (emoji, verbo PT). Nomes com prefixo de MCP
+# (`mcp__server__tool`) são normalizados por tool_short antes da busca,
+# então nunca caem no fallback sem dizer qual ferramenta é.
+_TOOL_VERBS = {
+    "read": ("📖", "Lendo"),
+    "write": ("📝", "Criando"),
+    "edit": ("✏️", "Editando"),
+    "bash": ("⚙️", "Rodando"),
+    "shell": ("⚙️", "Rodando"),
+    "glob": ("🗂️", "Buscando"),
+    "grep": ("🔍", "Buscando"),
+    "webfetch": ("🌐", "Pesquisando"),
+    "websearch": ("🌐", "Pesquisando"),
+    "todo": ("☑️", "Tarefas"),
+    "todowrite": ("☑️", "Tarefas"),
+    "todo_write": ("☑️", "Tarefas"),
+    "todo_read": ("☑️", "Tarefas"),
+    "task": ("🤖", "Executando"),
 }
 
-STREAM_MIN = 150
+
+def tool_short(name: str) -> str:
+    """`mcp__todoist__list-tasks` -> `list-tasks` (último segmento)."""
+    base = (name or "").strip()
+    if "__" in base:
+        base = base.split("__")[-1]
+    return base or "ferramenta"
+
+
+def tool_meta(name: str) -> tuple:
+    """(emoji, verbo) para o status; desconhecidas ganham 🔧 + nome curto."""
+    short = tool_short(name).lower()
+    if short in _TOOL_VERBS:
+        return _TOOL_VERBS[short]
+    if short.startswith("web"):
+        return ("🌐", "Pesquisando")
+    if short.startswith("todo"):
+        return ("☑️", "Tarefas")
+    return ("🔧", short)
+
+
+def _shorten(s: str, n: int = 40) -> str:
+    s = (s or "").strip().replace("\n", " ")
+    return (s[: n - 1] + "…") if len(s) > n else s
+
+
+def tool_arg(name: str, inp: dict | None, opencode_dir: str, title: str = "") -> str:
+    """Argumento principal da ferramenta (o que dá utilidade ao status)."""
+    short = tool_short(name).lower()
+    inp = inp if isinstance(inp, dict) else {}
+    arg = ""
+    if short in ("read", "write", "edit"):
+        p = _tool_file_path(inp)
+        arg = fmt_path(p, opencode_dir) if p else ""
+    elif short in ("grep", "glob"):
+        arg = str(inp.get("pattern") or inp.get("path") or "")
+    elif short in ("bash", "shell"):
+        arg = _tool_cmd_preview(inp)
+    elif short.startswith("web"):
+        arg = _research_query(inp) or _tool_cmd_preview(inp)
+    else:
+        arg = (title or "").strip() or _tool_cmd_preview(inp)
+    return _shorten(redact_secrets(arg))
 
 _SET_FIELDS = ("reads", "writes", "edits", "process_seen", "reasoning_part_ids")
 
@@ -175,7 +228,8 @@ def _record_tool(turn: dict, part: dict):
 
     if tool == "read":
         if status == "running":
-            turn["current"] = {"tool": tool, "label": f"lendo `{fmt_path(path, turn.get('_opencode_dir') or '')}`" if path else "lendo arquivo", "out": ""}
+            label = fmt_path(path, turn.get("_opencode_dir") or "") if path else ""
+            turn["current"] = {"tool": tool, "label": label.replace("`", ""), "out": ""}
         elif status in ("completed", "error") and path:
             turn["reads"].add(path)
             turn["current"] = None
@@ -183,7 +237,8 @@ def _record_tool(turn: dict, part: dict):
             turn["current"] = None
     elif tool == "write":
         if status == "running":
-            turn["current"] = {"tool": tool, "label": f"criando `{fmt_path(path, turn.get('_opencode_dir') or '')}`" if path else "criando arquivo", "out": ""}
+            label = fmt_path(path, turn.get("_opencode_dir") or "") if path else ""
+            turn["current"] = {"tool": tool, "label": label.replace("`", ""), "out": ""}
         elif status in ("completed", "error") and path:
             turn["writes"].add(path)
             turn["current"] = None
@@ -191,20 +246,20 @@ def _record_tool(turn: dict, part: dict):
             turn["current"] = None
     elif tool == "edit":
         if status == "running":
-            turn["current"] = {"tool": tool, "label": f"editando `{fmt_path(path, turn.get('_opencode_dir') or '')}`" if path else "editando arquivo", "out": ""}
+            label = fmt_path(path, turn.get("_opencode_dir") or "") if path else ""
+            turn["current"] = {"tool": tool, "label": label.replace("`", ""), "out": ""}
         elif status in ("completed", "error") and path:
             turn["edits"].add(path)
             turn["current"] = None
         else:
             turn["current"] = None
     else:
-        # label guarda SÓ o detalhe humano; ícone+nome saem no render
-        # (antes o nome ia duplicado: "[FIX] *nome:* [CFG] nome").
-        title = (state.get("title") or "").strip().replace("\n", " ")
+        # Nome curto (sem prefixo mcp__) + título limpo; o render monta o resto.
+        title = (state.get("title") or "").strip().replace("\n", " ").replace("`", "")
         if status == "error" and "permission" in (state.get("error") or "").lower():
             turn["rejected"] += 1
-            title = "[ERR] permissão negada"
-        turn["current"] = {"tool": tool, "label": title, "out": ""} if status == "running" else None
+            title = "permissão negada"
+        turn["current"] = {"tool": tool_short(tool), "label": title, "out": ""} if status == "running" else None
 
 
 def _tool_content_text(content) -> str:
@@ -778,60 +833,71 @@ def render_running(turn: dict, opencode_dir: str) -> dict:
         p = turn["perm_queue"][0]
         lines += ["", f"[LOCK] *Permissão:* {perm_desc(p)}"]
     if not has_prompt:
-        # Status = pensamento (reasoning) + ferramenta (tool); nunca out_text.
+        # Cabeçalho = ação atual (⏳); histórico = concluídas (✅/❌).
+        # Texto puro + emoji: sem *code* misturado, sem tags triplas.
         curr = turn["current"]
-        tname = (curr.get("tool") if isinstance(curr, dict) else None) or "ferramenta"
-        if curr and curr.get("cmd"):
-            lines += ["", f"» *{tname} rodando:* {code_span(redact_secrets(curr['cmd']))}"]
-            out = tail_out(curr.get("out"), 300)
-            if out:
-                lines += ["```", out, "```"]
-        elif curr and curr.get("label") is not None:
-            icon = TOOL_ICONS.get(tname, "[CFG]")
-            line = f"{icon} *{tname}*"
-            if (curr.get("label") or "").strip():
-                line += f": {curr['label'].strip()}"
-            lines += ["", line]
+        if isinstance(curr, dict) and (curr.get("cmd") or curr.get("label") is not None or curr.get("tool")):
+            tname = curr.get("tool") or "ferramenta"
+            emoji, verb = tool_meta(tname)
+            if curr.get("cmd"):
+                arg = _shorten(redact_secrets(curr["cmd"]))
+            else:
+                arg = _shorten((curr.get("label") or "").replace("`", ""))
+            head = f"⏳ {verb} {arg}".rstrip()
+            lines += ["", head]
         elif turn.get("reasoning_active") or (turn.get("reasoning_text") or "").strip():
-            lines += ["", "[...] *pensando…*"]
-            excerpt = tail_out(turn.get("reasoning_text") or "", 300)
-            if excerpt:
-                lines += ["```", excerpt, "```"]
+            lines += ["", "⏳ pensando…"]
         else:
-            lines += ["", "[...] *pensando…*"]
+            lines += ["", "⏳ pensando…"]
         hist = _history_lines(turn, opencode_dir)
         if hist:
-            lines += ["", "[HIST] *recentes:*", *hist]
+            lines += ["", "Recentes:", *hist]
     rows = q_keyboard(turn)
     if not rows and not has_prompt:
         rows = [[{"text": "Cancelar", "data": "/cancel"}]]
     return {"text": "\n".join(lines), "keyboard": rows}
 
 
-def _history_lines(turn: dict, opencode_dir: str, max_items: int = 6) -> list:
-    """Passos já concluídos em uma linha cada (o balão único alterna a
-    atividade atual; o passado recente fica aqui, compacto)."""
+def _history_lines(turn: dict, opencode_dir: str, max_items: int = 5) -> list:
+    """Últimas ações concluídas, uma por linha (ou colapsadas: `✅ 🔍 grep ×3`).
+
+    Um emoji por linha (✅/❌ + ferramenta), nome curto sempre visível,
+    argumento truncado em 40 chars. Sem tags `[OK] [FIND]` triplas."""
     cards = turn.get("tool_cards") or {}
     done = [c for c in cards.values()
             if isinstance(c, dict) and (c.get("status") or "") in ("completed", "error")]
-    out = []
-    for card in done[-max_items:]:
-        name = card.get("name") or "ferramenta"
-        icon = TOOL_ICONS.get(name, "[CFG]")
+    groups: list = []  # [ok, emoji, short, arg, count, last_card]
+    for card in done[-20:]:
+        name = tool_short(card.get("name") or "ferramenta")
+        emoji, _verb = tool_meta(name)
         inp = card.get("input") if isinstance(card.get("input"), dict) else {}
-        if name in ("read", "write", "edit"):
-            raw_path = _tool_file_path(inp)
-            target = fmt_path(raw_path, opencode_dir) if raw_path else ""
+        arg = tool_arg(name, inp, opencode_dir)
+        ok = (card.get("status") or "") == "completed"
+        key = (ok, emoji, name)
+        if groups and tuple(groups[-1][:3]) == key:
+            groups[-1][4] += 1
+            groups[-1][3] = arg  # arg mais recente do grupo
+            groups[-1][5] = card
         else:
-            target = _tool_cmd_preview(inp)
-        if target:
-            if len(target) > 50:
-                target = "…" + target[-49:]
-            label = f"{icon} `{name}` `{target}`"
-        else:
-            label = f"{icon} `{name}`"
-        mark = "[OK]" if (card.get("status") or "") == "completed" else "[ERR]"
-        out.append(f"{mark} {label}")
+            groups.append([ok, emoji, name, arg, 1, card])
+    out = []
+    for ok, emoji, name, arg, n, card in groups[-max_items:]:
+        mark = "✅" if ok else "❌"
+        if n > 1:
+            out.append(f"{mark} {emoji} {name} ×{n}")
+            continue
+        line = f"{mark} {emoji} {name} {arg}".rstrip()
+        # Retorno no formato `comando: retorno` (só onde agrega):
+        # bash concluída mostra a saída; qualquer erro mostra a mensagem.
+        if not ok:
+            err = _shorten(redact_secrets(card.get("error") or card.get("output") or ""), 80)
+            if err:
+                line += f": {err}"
+        elif name in ("bash", "shell"):
+            ret = _shorten(redact_secrets(card.get("output") or ""), 80)
+            if ret:
+                line += f": {ret}"
+        out.append(line)
     return out
 
 

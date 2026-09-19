@@ -11,31 +11,57 @@ import type { components } from "../types/openapi.ts";
 type S = components["schemas"];
 
 async function post<T>(path: string, body: unknown, timeoutMs = 20_000): Promise<T> {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), timeoutMs);
-  try {
-    const r = await fetch(`${WORKER_URL}${path}`, {
-      method: "POST",
-      signal: ctrl.signal,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body ?? {}),
-    });
-    if (!r.ok) throw new Error(`worker ${path} HTTP ${r.status}`);
-    return (await r.json()) as T;
-  } finally {
-    clearTimeout(t);
-  }
+  return withSocketRetry(() => {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), timeoutMs);
+    return (async () => {
+      try {
+        const r = await fetch(`${WORKER_URL}${path}`, {
+          method: "POST",
+          signal: ctrl.signal,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body ?? {}),
+        });
+        if (!r.ok) throw new Error(`worker ${path} HTTP ${r.status}`);
+        return (await r.json()) as T;
+      } finally {
+        clearTimeout(t);
+      }
+    })();
+  });
 }
 
 async function get<T>(path: string, query = "", timeoutMs = 20_000): Promise<T> {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  return withSocketRetry(() => {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), timeoutMs);
+    return (async () => {
+      try {
+        const r = await fetch(`${WORKER_URL}${path}${query}`, { signal: ctrl.signal });
+        if (!r.ok) throw new Error(`worker ${path} HTTP ${r.status}`);
+        return (await r.json()) as T;
+      } finally {
+        clearTimeout(t);
+      }
+    })();
+  });
+}
+
+/** Erro de socket fechado = transitório (restart do worker): tenta 1x de novo.
+ * Timeout do nosso lado NÃO retenta (o worker pode ainda estar executando). */
+function isSocketDrop(e: unknown): boolean {
+  const s = e instanceof Error ? `${e.name}: ${e.message}` : String(e ?? "");
+  return /socket .*closed|connection .*closed|ECONNRESET|terminated/i.test(s) && !/HTTP \d/.test(s);
+}
+
+async function withSocketRetry<T>(fn: () => Promise<T>): Promise<T> {
   try {
-    const r = await fetch(`${WORKER_URL}${path}${query}`, { signal: ctrl.signal });
-    if (!r.ok) throw new Error(`worker ${path} HTTP ${r.status}`);
-    return (await r.json()) as T;
-  } finally {
-    clearTimeout(t);
+    return await fn();
+  } catch (e) {
+    if (!isSocketDrop(e)) throw e;
+    console.warn(`worker: socket caiu, retentando 1x (${e instanceof Error ? e.message : e})`);
+    await Bun.sleep(1000);
+    return fn();
   }
 }
 
