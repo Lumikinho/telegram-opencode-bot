@@ -1,0 +1,25 @@
+# Segredos
+.env
+
+# Dados locais (sqlite do gateway)
+data/
+*.sqlite
+*.sqlite-journal
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.venv/
+
+# Bun / Node
+node_modules/
+dist/
+
+# Marcador de restart
+.restart_marker
+worker-openapi.json
