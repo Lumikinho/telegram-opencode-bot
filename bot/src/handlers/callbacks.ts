@@ -12,7 +12,12 @@ import {
 } from "../services/store.ts";
 import {
   askCustom,
+  cancelQueued,
   chooseOption,
+  clearQueue,
+  formatQueueHtml,
+  getQueue,
+  queueListKeyboard,
   rejectQuestions,
   replyPermission,
   submitQuestions,
@@ -185,5 +190,26 @@ export function registerCallbacks(bot: Bot, hooks: RestartHooks): void {
     const m = ctx.match as RegExpMatchArray;
     await ctx.answerCallbackQuery();
     await askCustom(bot, ctx.chat!.id, m[1], Number(m[2]));
+  });
+
+  // Fila: cancelar um pedido ou limpar tudo.
+  bot.callbackQuery(/^qcancel:(.+)$/, async (ctx) => {
+    const qid = (ctx.match as RegExpMatchArray)[1];
+    const ok = await cancelQueued(bot, ctx.chat!.id, qid);
+    await ctx.answerCallbackQuery(ok ? "pedido cancelado" : "já saiu da fila").catch(() => {});
+    try {
+      await ctx.editMessageReplyMarkup({ reply_markup: queueListKeyboard(getQueue(ctx.chat!.id)) }).catch(() => {});
+    } catch {
+      /* melhor-esforço */
+    }
+  });
+  bot.callbackQuery("qclear", async (ctx) => {
+    const n = await clearQueue(bot, ctx.chat!.id);
+    await ctx.answerCallbackQuery(n ? `${n} cancelado(s)` : "fila já vazia").catch(() => {});
+    try {
+      await ctx.editMessageText(formatQueueHtml(ctx.chat!.id), { parse_mode: "HTML" }).catch(() => {});
+    } catch {
+      /* melhor-esforço */
+    }
   });
 }

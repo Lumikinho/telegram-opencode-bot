@@ -1,13 +1,8 @@
 /** Mensagens livres (texto + anexos) -> turno opencode. */
 import type { Bot, Context } from "grammy";
-import { sendMessage, answerForm, answerPermission } from "../services/opencode.ts";
+import { answerForm, answerPermission } from "../services/opencode.ts";
 import { cfgFor, ensureSid } from "../services/store.ts";
-import {
-  consumeCustomAnswer,
-  finishTurn,
-  getTurn,
-  startTurn,
-} from "../services/turns.ts";
+import { consumeCustomAnswer, runOrEnqueue } from "../services/turns.ts";
 import { captionOf, collectMedia, downloadParts } from "../utils/media.ts";
 
 export function registerMessages(bot: Bot): void {
@@ -39,18 +34,7 @@ export function registerMessages(bot: Bot): void {
       return;
     }
     const cfg = cfgFor(chatId);
-    const turn = await startTurn(bot, chatId, target);
-    if (!turn) return; // já há turno rodando (startTurn avisou)
-    try {
-      await sendMessage(target, text, { model: cfg.model, agent: cfg.agent });
-    } catch (e) {
-      await ctx.reply(`[ERR] falha ao enviar: ${e}`.slice(0, 500));
-      const live = getTurn(chatId);
-      if (live) {
-        (live.state as Record<string, unknown>).out_text = `[ERR] Falha ao enviar para o opencode: ${e}`;
-        await finishTurn(bot, live);
-      }
-    }
+    await runOrEnqueue(bot, chatId, { sid: target, text, model: cfg.model, agent: cfg.agent });
   });
 
   bot.on(
@@ -83,22 +67,13 @@ export function registerMessages(bot: Bot): void {
       const files = parts.filter((p) => p.type === "file");
       const notes = parts.filter((p) => p.type === "text").map((p) => (p as { text: string }).text);
       const prompt = [text, ...notes].filter(Boolean).join("\n");
-      const turn = await startTurn(bot, ctx.chat.id, target);
-      if (!turn) return;
-      try {
-        await sendMessage(target, prompt, {
-          model: cfg.model,
-          agent: cfg.agent,
-          files: files as { type: "file"; url: string; filename?: string }[],
-        });
-      } catch (e) {
-        await ctx.reply(`[ERR] falha ao enviar: ${e}`.slice(0, 500));
-        const live = getTurn(ctx.chat.id);
-        if (live) {
-          (live.state as Record<string, unknown>).out_text = `[ERR] Falha ao enviar para o opencode: ${e}`;
-          await finishTurn(bot, live);
-        }
-      }
+      await runOrEnqueue(bot, ctx.chat.id, {
+        sid: target,
+        text: prompt,
+        model: cfg.model,
+        agent: cfg.agent,
+        files: files as { type: "file"; url: string; filename?: string }[],
+      });
     },
   );
 }

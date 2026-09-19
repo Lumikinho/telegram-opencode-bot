@@ -7,7 +7,20 @@
  */
 import { InlineKeyboard, type Bot } from "grammy";
 import { OPENCODE_DIR } from "../config/env";
-import { answerForm, answerPermission, type ServerEvent } from "./opencode";
+import { escHtml } from "./restart";
+import { emptyAnswerHint, friendlyError } from "../utils/errors";
+import { answerForm, answerPermission, sendMessage, type FilePart, type ServerEvent } from "./opencode";
+import {
+  dequeue,
+  enqueue,
+  listQueue,
+  previewOf,
+  queueSize,
+  removeFromQueue,
+  clearQueue as clearQueuePure,
+  type QueuedItem,
+  type QueueMap,
+} from "./queue.ts";
 import {
   turnAnswerCustom,
   turnDropForm,
@@ -47,8 +60,42 @@ export interface LiveTurn {
 const byChat = new Map<number, LiveTurn>();
 const bySid = new Map<string, number>();
 
+/** Fila por chat: pedidos que chegaram com turno ativo. */
+const pending: QueueMap = new Map();
+
 export function getTurn(chatId: number): LiveTurn | undefined {
   return byChat.get(chatId);
+}
+
+export function getQueue(chatId: number): QueuedItem[] {
+  return listQueue(pending, chatId);
+}
+
+export function getQueueSize(chatId: number): number {
+  return queueSize(pending, chatId);
+}
+
+export function hasActiveTurn(chatId: number): boolean {
+  return byChat.has(chatId);
+}
+
+function queueCancelKeyboard(qid: string): InlineKeyboard {
+  return new InlineKeyboard().text("❌ Cancelar este pedido", `qcancel:${qid}`);
+}
+
+export function queueListKeyboard(items: QueuedItem[]): InlineKeyboard | undefined {
+  if (!items.length) return undefined;
+  let kb = new InlineKeyboard();
+  items.slice(0, 8).forEach((q, i) => {
+    kb = kb.text(`❌ ${i + 1}. ${previewOf(q.text, 18)}`, `qcancel:${q.id}`);
+    kb = kb.row();
+  });
+  kb = kb.text("🧹 Limpar fila", "qclear");
+  return kb;
+}
+
+function esc(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 function sidOf(ev: ServerEvent): string | null {
@@ -129,6 +176,117 @@ export async function startTurn(bot: Bot, chatId: number, sid: string, placehold
     void flushStream(bot, t);
   }, 800);
   return t;
+}
+
+export interface RunPayload {
+  sid: string;
+  text: string;
+  model?: string;
+  agent?: string;
+  files?: FilePart[];
+}
+
+/**
+ * Executa agora ou enfileira por chat.
+ * - sem turno ativo: cria turno + envia prompt (retorna "started");
+ * - com turno ativo: guarda na fila e avisa posição + botão cancelar (retorna "queued").
+ *
+ * Exemplo: "faça um bolo" (started, bot fazendo) + "faça um brownie" (queued).
+ */
+export async function runOrEnqueue(bot: Bot, chatId: number, payload: RunPayload): Promise<"started" | "queued"> {
+  if (!byChat.has(chatId)) {
+    const turn = await startTurn(bot, chatId, payload.sid);
+    if (!turn) {
+      // Corrida: outro handler criou turno entre o has() e o startTurn.
+      return enqueueOnly(bot, chatId, payload);
+    }
+    try {
+      await sendMessage(payload.sid, payload.text, {
+        model: payload.model,
+        agent: payload.agent,
+        files: payload.files,
+      });
+    } catch (e) {
+      await bot.api.sendMessage(chatId, escHtml(friendlyError(e)).slice(0, 500), { parse_mode: "HTML" }).catch(() => {});
+      const live = getTurn(chatId);
+      if (live) {
+        (live.state as Record<string, unknown>).out_text = friendlyError(e);
+        await finishTurn(bot, live);
+      }
+    }
+    return "started";
+  }
+  return enqueueOnly(bot, chatId, payload);
+}
+
+async function enqueueOnly(bot: Bot, chatId: number, payload: RunPayload): Promise<"queued"> {
+  const { item, position } = enqueue(pending, chatId, payload);
+  const prev = position > 1 ? ` (${position - 1} antes)` : "";
+  try {
+    await bot.api.sendMessage(
+      chatId,
+      `⏳ <b>Na fila</b> — posição <b>${position}</b>${prev}.\n<code>${esc(previewOf(item.text, 140))}</code>\nUse /fila para ver ou cancelar.`,
+      { parse_mode: "HTML", reply_markup: queueCancelKeyboard(item.id) },
+    );
+  } catch {
+    /* fila vale mesmo sem aviso */
+  }
+  return "queued";
+}
+
+/** Tira o próximo da fila e executa (chamado ao fim de cada turno). */
+async function drainQueue(bot: Bot, chatId: number): Promise<void> {
+  if (byChat.has(chatId)) return;
+  const next = dequeue(pending, chatId);
+  if (!next) return;
+  const turn = await startTurn(bot, chatId, next.sid, `[...] *tirando da fila: ${previewOf(next.text, 60)}*`);
+  if (!turn) {
+    // Recoloca se algo criou turno no meio do caminho.
+    enqueue(pending, chatId, next, next.id);
+    return;
+  }
+  try {
+    await bot.api.sendMessage(chatId, `▶️ <b>Saindo da fila:</b> <code>${esc(previewOf(next.text, 140))}</code>`, {
+      parse_mode: "HTML",
+    }).catch(() => {});
+    await sendMessage(next.sid, next.text, { model: next.model, agent: next.agent, files: next.files });
+  } catch (e) {
+    await bot.api.sendMessage(chatId, escHtml(friendlyError(e)).slice(0, 500), { parse_mode: "HTML" }).catch(() => {});
+    const live = getTurn(chatId);
+    if (live) {
+      (live.state as Record<string, unknown>).out_text = friendlyError(e);
+      await finishTurn(bot, live);
+    }
+  }
+}
+
+/** Cancela um pedido enfileirado (botão ❌). Retorna true se achou. */
+export async function cancelQueued(bot: Bot, chatId: number, qid: string): Promise<boolean> {
+  const item = removeFromQueue(pending, chatId, qid);
+  if (!item) return false;
+  await bot.api.sendMessage(chatId, `🚫 <b>Pedido cancelado da fila:</b> <code>${esc(previewOf(item.text, 140))}</code>`, {
+    parse_mode: "HTML",
+  }).catch(() => {});
+  return true;
+}
+
+/** Limpa a fila inteira do chat. Retorna quantos foram removidos. */
+export async function clearQueue(bot: Bot, chatId: number): Promise<number> {
+  const items = clearQueuePure(pending, chatId);
+  if (items.length) {
+    await bot.api.sendMessage(chatId, `🧹 Fila limpa (${items.length} cancelado(s)).`).catch(() => {});
+  }
+  return items.length;
+}
+
+export function formatQueueHtml(chatId: number): string {
+  const items = getQueue(chatId);
+  const active = hasActiveTurn(chatId);
+  if (!active && !items.length) return "📭 Nada em andamento e fila vazia.";
+  const lines = items.map((q, i) => `${i + 1}. <code>${esc(previewOf(q.text, 90))}</code>`);
+  const head = active ? "🔨 <b>Bot fazendo</b> (1 ativo)" : "💤 Sem turno ativo";
+  if (!lines.length) return `${head}\n📭 Fila vazia.`;
+  return `${head}\n⏳ <b>Fila (${items.length}):</b>\n${lines.join("\n")}`;
 }
 
 export async function pushStatus(bot: Bot, t: LiveTurn, force = false): Promise<void> {
@@ -215,7 +373,7 @@ export async function finishTurn(bot: Bot, t: LiveTurn): Promise<void> {
     } catch (e) {
       console.warn("backfill falhou:", (e as Error)?.message ?? e);
       try {
-        await bot.api.sendMessage(t.chatId, `⚠️ <b>backfill falhou</b>\n<code>${String(e).slice(0, 400)}</code>`, {
+        await bot.api.sendMessage(t.chatId, `⚠️ <b>backfill falhou</b>\n${escHtml(friendlyError(e)).slice(0, 400)}`, {
           parse_mode: "HTML",
         });
       } catch {}
@@ -227,7 +385,7 @@ export async function finishTurn(bot: Bot, t: LiveTurn): Promise<void> {
       `turno vazio: sid=${sid || "?"} chat=${t.chatId} elapsed=${elapsed.toFixed(1)}s ` +
         `events=${t.events} tools=${Object.keys(cards).length}`,
     );
-    raw = "(sem resposta)";
+    raw = emptyAnswerHint();
   }
   const chunks = await turnSplit(raw, 3500);
   const bodies: string[] = [];
@@ -281,6 +439,7 @@ export async function finishTurn(bot: Bot, t: LiveTurn): Promise<void> {
   if (lastId !== null) {
     await bot.api.editMessageReplyMarkup(t.chatId, lastId, { reply_markup: afterTurnKeyboard() }).catch(() => {});
   }
+  await drainQueue(bot, t.chatId);
 }
 
 /** Roteia um evento SSE v2 para o turno da sessão (port de _dispatch). */
@@ -296,7 +455,7 @@ export async function routeEvent(bot: Bot, ev: ServerEvent): Promise<void> {
   } catch (e) {
     console.warn("fold falhou:", e);
     try {
-      await bot.api.sendMessage(t.chatId, `❌ <b>fold falhou</b>\n<code>${String(e).slice(0, 800)}</code>`, {
+      await bot.api.sendMessage(t.chatId, `❌ ${escHtml(friendlyError(e)).slice(0, 800)}`, {
         parse_mode: "HTML",
       });
     } catch {}
