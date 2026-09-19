@@ -1,0 +1,36 @@
+services:
+  worker:
+    build: ./worker
+    environment:
+      - WORKER_HOST=0.0.0.0
+      - WORKER_PORT=8090
+      - BATTERY_PATH=/sys/class/power_supply/battery
+    ports:
+      - "8090:8090"
+    volumes:
+      # sysfs da bateria (somente leitura; fora do Android, some — o worker tolera)
+      - /sys/class/power_supply:/sys/class/power_supply:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/healthz')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  bot:
+    build: ./bot
+    depends_on:
+      worker:
+        condition: service_healthy
+    env_file:
+      - path: .env
+        required: false # cp .env.example .env antes do up
+    environment:
+      - WORKER_URL=http://worker:8090
+      - DATA_DIR=/data
+    ports:
+      - "3000:3000" # webhook em prod (APP_ENV=prod + WEBHOOK_DOMAIN)
+    volumes:
+      - ./data:/data
+      - ${OPENCODE_DIR:-/home/lumiko}:/work:ro
+    restart: unless-stopped
